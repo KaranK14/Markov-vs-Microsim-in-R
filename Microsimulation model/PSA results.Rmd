@@ -1,0 +1,262 @@
+
+Microsimulation model: Code adapted from Krijkamp et al 2018
+Intervention: Proposed practice - Shift in clinical practice
+Comparator: Current practice - conservative practice
+  
+# Load packages
+```{r setup, include=FALSE}
+rm(list = ls())  # remove any variables in R's memory
+# Load libraries
+library(tidyverse)
+library(readxl)
+library(SciViews)
+# library(dampack)
+library(dplyr)
+library(writexl)
+library(parallel)
+library(doParallel)
+library(reshape2)
+library(cowplot)
+library(ggrepel)
+```
+
+# Setting
+```{r}
+v_names_str <- c("Current clinical practice", "Shift in clinical practice")
+```
+
+# Directories
+
+```{r}
+modelsloc <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Microsim model'
+inputsloc <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Inputs/'
+results_shift <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/PSA results microsim/Shift'
+results_current <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/PSA results microsim/Current'
+
+figuresloc <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Figures'
+
+monster_shift <- "P:/Markov vs microsim/Model/Model results/PSA results microsim/Shift"
+monster_current <- "P:/Markov vs microsim/Model/Model results/PSA results microsim/Current"
+```
+
+# PSA results of shift in clinical practice 
+```{r}
+# ## Set number of simulations
+# loops <- 500
+# 
+# ## Combine results into a single dataset
+# psa_simulation_results_shift1 <- NULL
+# 
+# for (loop in 1:loops) {
+#   print(paste0("Dataset ", loop, " of ", loops))
+#   
+#   # Construct the file path
+#   file_path <- file.path(monster_shift, paste0("sim_shift_clinical_practice_", loop, ".RData"))
+#   
+#   # Check if the file exists to avoid reading errors
+#   if (file.exists(file_path)) {
+#     # Load the .Rds file
+#     psa_results <- readRDS(file_path)
+#   # Append the loaded data to the list
+#     psa_simulation_results_shift1[[loop]] <- psa_results
+#   } else {
+#     print(paste0("File not found: ", file_path))
+#   }
+# }
+# 
+# ## Set number of simulations
+# loops <- 1000
+# 
+# ## Combine results into a single dataset
+# psa_simulation_results_shift2 <- NULL
+# 
+# for (loop in 500:loops) {
+#   print(paste0("Dataset ", loop, " of ", loops))
+#   
+#   # Construct the file path
+#   file_path <- file.path(results_shift, paste0("sim_shift_clinical_practice_", loop, ".RData"))
+#   
+#   # Check if the file exists to avoid reading errors
+#   if (file.exists(file_path)) {
+#     # Load the .Rds file
+#     psa_results_2 <- readRDS(file_path)
+#   # Append the loaded data to the list
+#     psa_simulation_results_shift2[[loop]] <- psa_results_2
+#   } else {
+#     print(paste0("File not found: ", file_path))
+#   }
+# }
+# 
+# # Combine the two lists into one
+# combined_psa_results_shift <- c(psa_simulation_results_shift1[1:500], psa_simulation_results_shift2[501:1000])
+# 
+# save(file = file.path(results_shift, paste0("combined_psaresults_", gsub("-", "", Sys.Date()), ".RData")),
+#      combined_psa_results_shift)
+
+load(file = file.path(results_shift,  "combined_psaresults_20240513.RData"))
+```
+
+# PSA results of current clinical practice 
+```{r}
+# ## Set number of simulations
+# loops <- 500
+# 
+# ## Combine results into a single dataset
+# psa_simulation_results_current1 <- NULL
+# 
+# for (loop in 1:loops) {
+#   print(paste0("Dataset ", loop, " of ", loops))
+#   
+#   # Construct the file path
+#   file_path <- file.path(monster_current, paste0("sim_current_clinical_practice_", loop, ".RData"))
+#   
+#   # Check if the file exists to avoid reading errors
+#   if (file.exists(file_path)) {
+#     # Load the .Rds file
+#     psa_results <- readRDS(file_path)
+#   # Append the loaded data to the list
+#     psa_simulation_results_current1[[loop]] <- psa_results
+#   } else {
+#     print(paste0("File not found: ", file_path))
+#   }
+# }
+# 
+# ## Set number of simulations
+# loops <- 1000
+# 
+# ## Combine results into a single dataset
+# psa_simulation_results_current2 <- NULL
+# 
+# for (loop in 500:loops) {
+#   print(paste0("Dataset ", loop, " of ", loops))
+#   
+#   # Construct the file path
+#   file_path <- file.path(results_current, paste0("sim_current_clinical_practice_", loop, ".RData"))
+#   
+#   # Check if the file exists to avoid reading errors
+#   if (file.exists(file_path)) {
+#     # Load the .Rds file
+#     psa_results_2 <- readRDS(file_path)
+#   # Append the loaded data to the list
+#     psa_simulation_results_current2[[loop]] <- psa_results_2
+#   } else {
+#     print(paste0("File not found: ", file_path))
+#   }
+# }
+
+# Combine the two lists into one
+# combined_psa_results_current <- c(psa_simulation_results_current1[1:500], psa_simulation_results_current2[501:1000])
+# 
+# save(file = file.path(results_current, paste0("combined_psaresults_", gsub("-", "", Sys.Date()), ".RData")),
+     # combined_psa_results_current)
+
+load(file = file.path(results_current,  "combined_psaresults_20240513.RData"))
+
+```
+
+# Extract total costs and total effects
+```{r}
+# Create a function to extract costs
+extract_tc_hat <- function(sim_result) {
+  if("tc_hat" %in% names(sim_result)) {
+    return(sim_result$tc_hat)
+  } else {
+    return(null)
+  }
+}
+
+## costs
+tc_hat_list_shift <- lapply(combined_psa_results_shift, extract_tc_hat)
+tc_hat_list_current <- lapply(combined_psa_results_current, extract_tc_hat)
+
+tc_hat_shift_df<- data.frame(tc_hat = unlist(tc_hat_list_shift))
+tc_hat_current_df<- data.frame(tc_hat = unlist(tc_hat_list_current))
+
+
+# Create a function to extract effects
+extract_te_hat <- function(sim_result) {
+  if("te_hat" %in% names(sim_result)) {
+    return(sim_result$te_hat)
+  } else {
+    return(null)
+  }
+}
+
+# effects
+te_hat_list_shift <- lapply(combined_psa_results_shift, extract_te_hat)
+te_hat_list_current <- lapply(combined_psa_results_current, extract_te_hat)
+
+te_hat_shift_df <- data.frame(te_hat = unlist(te_hat_list_shift))
+te_hat_current_df <- data.frame(te_hat = unlist(te_hat_list_current))
+```
+
+# Combine costs and effects for each strategy
+```{r}
+df_c <- cbind(tc_hat_current_df, tc_hat_shift_df)
+
+df_e <- cbind(te_hat_current_df, te_hat_shift_df)
+
+```
+
+# Visualize PSA results and CEA 
+```{r}
+# Define the file path
+source(file.path("C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Markov model/R/Functions.R"))
+
+l_psa <- make_psa_obj(cost          = df_c, 
+                      effectiveness = df_e,
+                      strategies    = v_names_str)
+
+l_psa$strategies <- v_names_str
+colnames(l_psa$effectiveness)<- v_names_str
+colnames(l_psa$cost)<- v_names_str
+
+#* Vector with willingness-to-pay (WTP) thresholds.
+v_wtp <- seq(0, 50000, by = 5000)
+
+### Cost-Effectiveness Scatter plot ----
+scatter <- plot.psa(l_psa) +
+  ggthemes::scale_color_colorblind() +
+  ggthemes::scale_fill_colorblind() +
+  xlab("Effectiveness (QALYs)") +
+  guides(col = guide_legend(nrow = 2)) +
+  theme(legend.position = "bottom")
+
+ggsave(filename = file.path(figuresloc, paste0("microsim_psa_scatter_plot", gsub("-", "", Sys.Date()), ".png")),
+       plot = scatter)
+
+
+### Incremental cost-effectiveness ratios (ICERs) with probabilistic output ----
+df_out_ce_psa <- summary.psa(l_psa)
+
+df_cea_psa <- calculate_icers(
+  cost       = df_out_ce_psa$meanCost,
+  effect     = df_out_ce_psa$meanEffect,
+  strategies = df_out_ce_psa$Strategy
+)
+
+df_cea_psa
+
+### Plot cost-effectiveness frontier with probabilistic output 
+icers_plot <- plot.icers(df_cea_psa)
+
+ggsave(filename = file.path(figuresloc, paste0("microsim_psa_icer_plot", gsub("-", "", Sys.Date()), ".png")),
+       plot = icers_plot)
+
+## Cost-effectiveness acceptability curves (CEACs) and frontier (CEAF) ---
+ceac_obj <- ceac(wtp = v_wtp, psa = l_psa)
+summary.ceac(ceac_obj)
+
+#* CEAC & CEAF plot
+ceac <- plot.ceac(ceac_obj) +
+  ggthemes::scale_color_colorblind() +
+  ggthemes::scale_fill_colorblind() +
+  theme(legend.position = c(0.82, 0.5))
+
+ggsave(filename = file.path(figuresloc, paste0("microsim_ceac_icer_plot", gsub("-", "", Sys.Date()), ".png")),
+       plot = ceac)
+
+
+```
+```
+

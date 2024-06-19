@@ -1,0 +1,4404 @@
+---
+title: "Microsim model"
+author: "Karan Ketan Shah"
+date: "2023-08-15"
+output: html_document
+
+Microsimulation model: Code adapted from Krijkamp et al 2018
+Intervention: Proposed practice - Shift in clinical practice
+Comparator: Current practice - conservative practice
+  
+---
+
+# Load packages
+```{r setup, include=FALSE}
+rm(list = ls())  # remove any variables in R's memory
+
+# Load libraries
+library(tidyverse)
+library(readxl)
+library(SciViews)
+# library(dampack)
+library(dplyr)
+library(writexl)
+library(parallel)
+library(doParallel)
+library(reshape2)
+library(cowplot)
+
+```
+
+# Directories
+
+```{r}
+modelsloc <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Microsim model'
+inputsloc <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Inputs/'
+modelresults <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/'
+figuresloc <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Figures/'
+```
+
+# Load input files
+
+```{r}
+# load the data and capture the names of the loaded variables
+costs_vars <- load(file.path(inputsloc, 'costs.RData'))
+utility_vars <- load(file.path(inputsloc, 'Utility.RData'))
+transition_probs_vars <- load(file.path(inputsloc, 'transition_probs.RData'))
+```
+
+# Model setting
+
+```{r}
+cycle_length <- 0.25 # cycle length is 3 months
+Trt <-  c("Shift in practice", "Conservative practice") # store the strategy names
+d.e <-  d.c <- 0.0125 # discount rate adjusted for 3 monthly cycle length
+n_t <- 80 # number of cycles
+n_c <- 1000000 # number of people
+per_effect_hcv <- 0.05/4 # increase in % of kidney transplantation in proposed policy. These patients will directly go to HCV health state
+per_effect_increased_risk_behaviours <- 0.02/4 # increase in % of kidney transplantation in proposed policy. These patients will directly go to SCD health states
+tp_graft_failure <- round(tp_graft_failure, 4) # just rounding the value
+tp_HIV_current_practice <- 0 # no hiv transmissions in the current practice
+
+c_diagosis_proposed_policy <- 3348.9
+c_treating_hepC <- sum(c_diagnosing_HCV$Value, mean(c(c_treating_mild_moderate_chronic_hepC_gen1_2$Value, c_treating_mild_moderate_chronic_hepC_gen3$Value)))
+n_death_waitlist <- 0.0011
+```
+
+
+# Names of the health states in the model
+
+```{r}
+v_names_health_states <-
+  c(
+    "On waitlist",
+    "DBD SCD good",
+    "DBD SCD moderate",
+    "DBD SCD poor",
+    "DBD ECD good",
+    "DBD ECD moderate",
+    "DBD ECD poor",
+    "DCD good",
+    "DCD moderate",
+    "DCD poor",
+    "Good graft DBD SCD",
+    "Good graft DBD ECD",
+    "Good graft DCD",
+    "Moderate graft DBD SCD",
+    "Moderate graft DBD ECD",
+    "Moderate graft DCD",
+    "Poor graft DBD SCD",
+    "Poor graft DBD ECD",
+    "Poor graft DCD",
+    "Off waitlist",
+    "HIV",
+    "HBV",
+    "HCV",
+    "Hep B Comp cirr",
+    "Hep B Decomp cirr",
+    "Hep B HCC",
+    "Spon clearance",
+    "Hep C Comp cirr",
+    "Hep C Decomp cirr",
+    "Hep C HCC",
+    "SVR",
+    "Liver transplant 3",
+    "Liver transplant 6",
+    "Liver transplant 9",
+    "Liver transplant 12",
+    "Liver transplant yr 2",
+    "Death on waitlist",
+    "Death off waitlist",
+    "Death after graft failure",
+    "Death w functioning graft",
+    "Death end stage liver")
+
+n_states <- length(v_names_health_states) # number of health states
+
+v_m_on_waitlist <-
+  rep("On waitlist", n_c) # all starting on waitlist 
+
+```
+
+# Microsim function for the proposed practice - shift in clinical practice
+
+```{r}
+Microsim_pp <-
+  function(v_m_on_waitlist,
+           n_c,
+           n_t,
+           v_names_health_states,
+           d.c,
+           d.e,
+           TR.out = TRUE,
+           TS.out = TRUE,
+           Trt = FALSE,
+           seed = 1) {
+   
+    v.dwc <- 1 / (1 + d.c) ^ (0:n_t)   # cost discount weight based on the discount rate d.c
+    v.dwe <- 1 / (1 + d.e) ^ (0:n_t)   # QALY discount weight based on the discount rate d.e
+    
+    # matrix capturing the state name/costs/health outcomes for all individuals at each time point
+    m.M <- m.C <- m.E <-  matrix(nrow = n_c,
+                                 ncol = n_t + 1,
+                                 dimnames = list(paste("ind", 1:n_c, sep = " "),
+                                                 paste("cycle", 0:n_t, sep = " ")))
+    
+    m.M[, 1] <- v_m_on_waitlist   # initial health state for all individuals
+    
+    # # Ensure all_transitions is available
+    # if (!exists("all_transitions")) {
+    #   stop("all_transitions is not defined. Please define it before running the simulation.")
+    # }
+     
+    for (i in 1:n_c) {
+    
+      set.seed(seed + i)  # set the seed for every individual for the random number generator
+    
+      previous_state <- NA  # Initializing previous state
+    
+     m.C[i, 1] <- Costs_pp(m.M[i, 1] , Trt)  # estimate costs per individual for the initial health state. Trt = FALSE. This was because both current and proposed practice individuals will be on waitlist and the cost will be same initially
+
+      m.E[i, 1] <-  Effs(m.M[i, 1], Trt)  # estimate costs per individual for the initial health state. Trt = FALSE. This was because both current and proposed practice individuals will be on waitlist and the qalys will be same initially
+
+
+    for (t in 1:n_t) {  # adjusted to prevent out-of-bounds when accessing t+1
+        current_state <- m.M[i, t]
+
+        # Calculate transition probabilities
+        v.p.it <- Probs_pp(current_state = current_state, all_transitions)  
+
+        # Ensure that there's at least one possible transition
+        if (sum(v.p.it, na.rm = TRUE) == 0) {
+          stop(paste("No possible transitions from state", current_state))
+        }
+
+        # Sampling the next state based on probabilities
+        next_state <- sample(v_names_health_states, size = 1, prob = v.p.it)
+
+        # Updating matrix for the next state
+        m.M[i, t + 1] <- next_state
+
+        # Calculate costs and effects for the new state, now using t+1
+        m.C[i, t + 1] <- Costs_pp(next_state, current_state, Trt)  
+        m.E[i, t + 1] <- Effs(next_state, current_state, Trt)  
+
+        # Update previous_state for the next cycle
+        previous_state <- current_state
+    }
+
+    if (i / 100 == round(i / 100, 0)) {
+        # Display the progress of the simulation
+        cat('\r', paste(i / n_c * 100, "% done", sep = " "))
+    }
+}
+    
+    tc <-
+      m.C %*% v.dwc       # total (discounted) cost per individual
+    te <-
+      m.E %*% v.dwe       # total (discounted) QALYs per individual
+    
+    tc_hat <- mean(tc)        # average (discounted) cost
+    te_hat <- mean(te)        # average (discounted) QALYs
+    
+    if (TS.out == TRUE) {
+      # create a  matrix of transitions across states
+      TS <-
+        paste(m.M, cbind(m.M[, -1], NA), sep = "->") # transitions from one state to the other
+      TS <- matrix(TS, nrow = n_c)
+      rownames(TS) <-
+        paste("Ind",   1:n_c, sep = " ")   # name the rows
+      colnames(TS) <-
+        paste("Cycle", 0:n_t, sep = " ")   # name the columns
+    } else {
+      TS <- NULL
+    }
+    
+    if (TR.out == TRUE) {
+      # create a trace from the individual trajectories
+      TR <-
+        t(apply(m.M, 2, function(x)
+          table(
+            factor(x, levels = v_names_health_states, ordered = TRUE)
+          ))) # rows are cycles and columns are health state names. Number of individuals at each cyle in health states
+      TR <-
+        TR / n_c # create a distribution trace
+      rownames(TR) <-
+        paste("Cycle", 0:n_t, sep = " ") # name the rows
+      colnames(TR) <-
+        v_names_health_states # name the columns
+    } else {
+      TR <- NULL
+    }
+    
+    results <-
+      list(
+        m.M = m.M,
+        m.C = m.C,
+        m.E = m.E,
+        tc = tc,
+        te = te,
+        tc_hat = tc_hat,
+        te_hat = te_hat,
+        TS = TS,
+        TR = TR
+      ) # store the results from the simulation in a list
+    return(results)  # return the results
+    # end of the MicroSim function
+  }
+```
+
+
+# Microsim function for the current practice
+
+```{r}
+Microsim_cp <-
+  function(v_m_on_waitlist,
+           n_c,
+           n_t,
+           v_names_health_states,
+           d.c,
+           d.e,
+           TR.out = TRUE,
+           TS.out = TRUE,
+           Trt = FALSE,
+           seed = 1) {
+   
+    v.dwc <- 1 / (1 + d.c) ^ (0:n_t)   # cost discount weight based on the discount rate d.c
+    v.dwe <- 1 / (1 + d.e) ^ (0:n_t)   # QALY discount weight based on the discount rate d.e
+    
+    # matrix capturing the state name/costs/health outcomes for all individuals at each time point
+    m.M <- m.C <- m.E <-  matrix(nrow = n_c,
+                                 ncol = n_t + 1,
+                                 dimnames = list(paste("ind", 1:n_c, sep = " "),
+                                                 paste("cycle", 0:n_t, sep = " ")))
+    
+    m.M[, 1] <- v_m_on_waitlist   # initial health state for all individuals
+    
+    # # Ensure all_transitions is available
+    # if (!exists("all_transitions")) {
+    #   stop("all_transitions is not defined. Please define it before running the simulation.")
+    # }
+     
+    for (i in 1:n_c) {
+    
+      set.seed(seed + i)  # set the seed for every individual for the random number generator
+    
+      previous_state <- NA  # Initializing previous state
+    
+     m.C[i, 1] <- Costs_cp(m.M[i, 1] , Trt)  # estimate costs per individual for the initial health state. Trt = FALSE. This was because both current and proposed practice individuals will be on waitlist and the cost will be same initially
+
+      m.E[i, 1] <-  Effs(m.M[i, 1], Trt)  # estimate costs per individual for the initial health state. Trt = FALSE. This was because both current and proposed practice individuals will be on waitlist and the qalys will be same initially
+
+
+    for (t in 1:n_t) {  # adjusted to prevent out-of-bounds when accessing t+1
+        current_state <- m.M[i, t]
+
+        # Calculate transition probabilities
+        v.p.it <- Probs_cp(current_state = current_state, all_transitions_cp)  
+
+        # Ensure that there's at least one possible transition
+        if (sum(v.p.it, na.rm = TRUE) == 0) {
+          stop(paste("No possible transitions from state", current_state))
+        }
+
+        # Sampling the next state based on probabilities
+        next_state <- sample(v_names_health_states, size = 1, prob = v.p.it)
+
+        # Updating matrix for the next state
+        m.M[i, t + 1] <- next_state
+
+        # Calculate costs and effects for the new state, now using t+1
+        m.C[i, t + 1] <- Costs_cp(next_state, current_state, Trt)  
+        m.E[i, t + 1] <- Effs(next_state, current_state, Trt)  
+
+        # Update previous_state for the next cycle
+        previous_state <- current_state
+    }
+
+    if (i / 100 == round(i / 100, 0)) {
+        # Display the progress of the simulation
+        cat('\r', paste(i / n_c * 100, "% done", sep = " "))
+    }
+}
+    
+    tc <-
+      m.C %*% v.dwc       # total (discounted) cost per individual
+    te <-
+      m.E %*% v.dwe       # total (discounted) QALYs per individual
+    
+    tc_hat <- mean(tc)        # average (discounted) cost
+    te_hat <- mean(te)        # average (discounted) QALYs
+    
+    if (TS.out == TRUE) {
+      # create a  matrix of transitions across states
+      TS <-
+        paste(m.M, cbind(m.M[, -1], NA), sep = "->") # transitions from one state to the other
+      TS <- matrix(TS, nrow = n_c)
+      rownames(TS) <-
+        paste("Ind",   1:n_c, sep = " ")   # name the rows
+      colnames(TS) <-
+        paste("Cycle", 0:n_t, sep = " ")   # name the columns
+    } else {
+      TS <- NULL
+    }
+    
+    if (TR.out == TRUE) {
+      # create a trace from the individual trajectories
+      TR <-
+        t(apply(m.M, 2, function(x)
+          table(
+            factor(x, levels = v_names_health_states, ordered = TRUE)
+          ))) # rows are cycles and columns are health state names. Number of individuals at each cyle in health states
+      TR <-
+        TR / n_c # create a distribution trace
+      rownames(TR) <-
+        paste("Cycle", 0:n_t, sep = " ") # name the rows
+      colnames(TR) <-
+        v_names_health_states # name the columns
+    } else {
+      TR <- NULL
+    }
+    
+    results <-
+      list(
+        m.M = m.M,
+        m.C = m.C,
+        m.E = m.E,
+        tc = tc,
+        te = te,
+        tc_hat = tc_hat,
+        te_hat = te_hat,
+        TS = TS,
+        TR = TR
+      ) # store the results from the simulation in a list
+    return(results)  # return the results
+    # end of the MicroSim function
+  }
+```
+
+# Helper function for blood group transitions
+```{r}
+calculate_bloodgrp_transitions_transplant <-
+  function(tp_transplant, pro_blood_grp) {
+    return(
+      tp_transplant_bloodgrp_A * pro_blood_grp_A +
+        tp_transplant_bloodgrp_B * pro_blood_grp_B +
+        tp_transplant_bloodgrp_AB * pro_blood_grp_AB +
+        tp_transplant_bloodgrp_O * pro_blood_grp_O
+    )
+  }
+
+calculate_bloodgrp_transitions_suspension <-
+  function(tp_suspension, pro_blood_grp) {
+    return(
+      tp_off_waitlist_bloodgrp_A * pro_blood_grp_A +
+        tp_off_waitlist_bloodgrp_B * pro_blood_grp_B +
+        tp_off_waitlist_bloodgrp_AB * pro_blood_grp_AB +
+        tp_off_waitlist_bloodgrp_O * pro_blood_grp_O
+    )
+  }
+
+# Calculate transitions for transplant and suspension using blood group proportions
+bloodgrp_transition_transplant_DBDSCD = round(
+  calculate_bloodgrp_transitions_transplant(tp_transplant, pro_blood_grp) * pro_DBDSCD,
+  3
+)
+bloodgrp_transition_transplant_DBDECD = round(
+  calculate_bloodgrp_transitions_transplant(tp_transplant, pro_blood_grp) * pro_DBDECD,
+  3
+)
+bloodgrp_transition_transplant_DCD = round(
+  calculate_bloodgrp_transitions_transplant(tp_transplant, pro_blood_grp) * pro_DCD,
+  3
+)
+
+bloodgrp_transition_suspension_DBDSCD = round(
+  calculate_bloodgrp_transitions_suspension(tp_suspension, pro_blood_grp) * pro_DBDSCD,
+  3
+)
+bloodgrp_transition_suspension_DBDECD = round(
+  calculate_bloodgrp_transitions_suspension(tp_suspension, pro_blood_grp) * pro_DBDECD,
+  3
+)
+bloodgrp_transition_suspension_DCD = round(
+  calculate_bloodgrp_transitions_suspension(tp_suspension, pro_blood_grp) * pro_DCD,
+  3
+)
+
+susp_prob <-
+  bloodgrp_transition_suspension_DBDSCD + bloodgrp_transition_suspension_DBDECD + bloodgrp_transition_suspension_DCD
+
+tx_fail_to_off_wlst <-
+  round(
+    bloodgrp_transition_transplant_DBDSCD * tp_graft_failure +
+      bloodgrp_transition_transplant_DBDECD * tp_graft_failure +
+      bloodgrp_transition_transplant_DCD * tp_graft_failure,
+    4
+  )
+```
+
+
+# Proposed practice - Define transition probabilities for different health states
+## On Waitlist
+```{r}
+on_waitlist_transitions <- c(
+  "On waitlist" = 1 - sum(round(bloodgrp_transition_transplant_DBDSCD * (1 - pro_DBDSCD_mg - pro_DBDSCD_pg - tp_graft_failure),4),
+    round(per_effect_increased_risk_behaviours * (1 - pro_DBDSCD_mg - pro_DBDSCD_pg - tp_graft_failure),4),
+    round(bloodgrp_transition_transplant_DBDSCD * pro_DBDSCD_mg, 4),
+    round(pro_DBDSCD_mg * per_effect_increased_risk_behaviours, 4),
+    round(bloodgrp_transition_transplant_DBDSCD * pro_DBDSCD_pg, 4),
+    round(pro_DBDSCD_pg * per_effect_increased_risk_behaviours, 4),
+    round(bloodgrp_transition_transplant_DBDECD * (1 - pro_DBDECD_mg - pro_DBDECD_pg - tp_graft_failure),4),
+    round(bloodgrp_transition_transplant_DBDECD * pro_DBDECD_mg, 4),
+    round(bloodgrp_transition_transplant_DBDECD * pro_DBDECD_pg, 4),
+    round(bloodgrp_transition_transplant_DCD * (1 - pro_DCD_mg - pro_DCD_pg - tp_graft_failure),4),
+    round(bloodgrp_transition_transplant_DCD * pro_DCD_mg, 4),
+    round(bloodgrp_transition_transplant_DCD * pro_DCD_pg, 4),
+    round(susp_prob + tx_fail_to_off_wlst, 4),
+    per_effect_hcv,
+    n_death_waitlist),
+  
+  "DBD SCD good" = round(bloodgrp_transition_transplant_DBDSCD * (1 - pro_DBDSCD_mg - pro_DBDSCD_pg - tp_graft_failure),4) +
+    round(per_effect_increased_risk_behaviours * (1 - pro_DBDSCD_mg - pro_DBDSCD_pg - tp_graft_failure),4),
+  
+  "DBD SCD moderate" = round(bloodgrp_transition_transplant_DBDSCD * pro_DBDSCD_mg, 4) +
+    round(pro_DBDSCD_mg * per_effect_increased_risk_behaviours, 4),
+  
+  "DBD SCD poor" = round(bloodgrp_transition_transplant_DBDSCD * pro_DBDSCD_pg, 4) +
+    round(pro_DBDSCD_pg * per_effect_increased_risk_behaviours, 4),
+  
+  "DBD ECD good" = round(bloodgrp_transition_transplant_DBDECD * (1 - pro_DBDECD_mg - pro_DBDECD_pg - tp_graft_failure),4),
+  
+  "DBD ECD moderate" = round(bloodgrp_transition_transplant_DBDECD * pro_DBDECD_mg, 4),
+  
+  "DBD ECD poor" = round(bloodgrp_transition_transplant_DBDECD * pro_DBDECD_pg, 4),
+  
+  "DCD good" =  round(bloodgrp_transition_transplant_DCD * (1 - pro_DCD_mg - pro_DCD_pg - tp_graft_failure),4),
+  
+  "DCD moderate" = round(bloodgrp_transition_transplant_DCD * pro_DCD_mg, 4),
+  
+  "DCD poor" = round(bloodgrp_transition_transplant_DCD * pro_DCD_pg, 4),
+  
+  "Off waitlist" = round(susp_prob + tx_fail_to_off_wlst, 4),
+  
+  "HCV" = per_effect_hcv,
+  
+  "Death on waitlist" = n_death_waitlist
+  
+)
+```
+
+## DBD SCD
+```{r}
+#good
+DBD_SCD_good_transitions <- c(
+  "Good graft DBD SCD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+
+#moderate
+DBD_SCD_moderate_transitions <- c(
+  "Moderate graft DBD SCD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+
+#poor
+DBD_SCD_poor_transitions <- c(
+  "Poor graft DBD SCD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+```
+
+## DBD ECD
+```{r}
+#good
+DBD_ECD_good_transitions <- c(
+  "Good graft DBD ECD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+
+#moderate
+DBD_ECD_moderate_transitions <- c(
+  "Moderate graft DBD ECD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+
+#poor
+DBD_ECD_poor_transitions <- c(
+  "Poor graft DBD ECD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+```
+
+## DCD
+```{r}
+#good
+DCD_good_transitions <- c(
+  "Good graft DCD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+
+#moderate
+DCD_moderate_transitions <- c(
+  "Moderate graft DCD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+
+#poor
+DCD_poor_transitions <- c(
+  "Poor graft DCD" = 1 - sum(
+    round(tp_HIV_proposed_practice, 7),
+    round(tp_HBV_proposed_practice, 4),
+    round(tp_HCV_proposed_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_proposed_practice, 7),
+  
+  "HBV" = round(tp_HBV_proposed_practice, 4),
+  
+  "HCV" = round(tp_HCV_proposed_practice, 5)
+  
+)
+```
+
+# Current practice - Define transition probabilities for different health states
+## On Waitlist
+```{r}
+on_waitlist_transitions_cp <- c(
+  "On waitlist" = 1 - sum(round(bloodgrp_transition_transplant_DBDSCD * (1 - pro_DBDSCD_mg - pro_DBDSCD_pg - tp_graft_failure),4),
+    round(bloodgrp_transition_transplant_DBDSCD * pro_DBDSCD_mg, 4),
+    round(bloodgrp_transition_transplant_DBDSCD * pro_DBDSCD_pg, 4),
+    round(bloodgrp_transition_transplant_DBDECD * (1 - pro_DBDECD_mg - pro_DBDECD_pg - tp_graft_failure),4),
+    round(bloodgrp_transition_transplant_DBDECD * pro_DBDECD_mg, 4),
+    round(bloodgrp_transition_transplant_DBDECD * pro_DBDECD_pg, 4),
+    round(bloodgrp_transition_transplant_DCD * (1 - pro_DCD_mg - pro_DCD_pg - tp_graft_failure),4),
+    round(bloodgrp_transition_transplant_DCD * pro_DCD_mg, 4),
+    round(bloodgrp_transition_transplant_DCD * pro_DCD_pg, 4),
+    round(susp_prob + tx_fail_to_off_wlst, 4),
+    n_death_waitlist
+  ),
+  
+  "DBD SCD good" = round(bloodgrp_transition_transplant_DBDSCD * (1 - pro_DBDSCD_mg - pro_DBDSCD_pg - tp_graft_failure),4) ,
+  
+  "DBD SCD moderate" = round(bloodgrp_transition_transplant_DBDSCD * pro_DBDSCD_mg, 4), 
+  
+  "DBD SCD poor" = round(bloodgrp_transition_transplant_DBDSCD * pro_DBDSCD_pg, 4),
+  
+  "DBD ECD good" = round(bloodgrp_transition_transplant_DBDECD * (1 - pro_DBDECD_mg - pro_DBDECD_pg - tp_graft_failure),4),
+  
+  "DBD ECD moderate" = round(bloodgrp_transition_transplant_DBDECD * pro_DBDECD_mg, 4),
+  
+  "DBD ECD poor" = round(bloodgrp_transition_transplant_DBDECD * pro_DBDECD_pg, 4),
+  
+  "DCD good" =  round(bloodgrp_transition_transplant_DCD * (1 - pro_DCD_mg - pro_DCD_pg - tp_graft_failure),4),
+  
+  "DCD moderate" = round(bloodgrp_transition_transplant_DCD * pro_DCD_mg, 4),
+  
+  "DCD poor" = round(bloodgrp_transition_transplant_DCD * pro_DCD_pg, 4),
+  
+  "Off waitlist" = round(susp_prob + tx_fail_to_off_wlst, 4),
+  
+  "Death on waitlist" = n_death_waitlist
+  
+)
+```
+
+## DBD SCD
+```{r}
+#good
+DBD_SCD_good_transitions_cp <- c(
+  "Good graft DBD SCD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+
+#moderate
+DBD_SCD_moderate_transitions_cp <- c(
+  "Moderate graft DBD SCD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+
+#poor
+DBD_SCD_poor_transitions_cp <- c(
+  "Poor graft DBD SCD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+```
+
+## DBD ECD
+```{r}
+#good
+DBD_ECD_good_transitions_cp <- c(
+  "Good graft DBD ECD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+
+#moderate
+DBD_ECD_moderate_transitions_cp <- c(
+  "Moderate graft DBD ECD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+
+#poor
+DBD_ECD_poor_transitions_cp <- c(
+  "Poor graft DBD ECD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+```
+
+## DCD
+```{r}
+#good
+DCD_good_transitions_cp <- c(
+  "Good graft DCD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+
+#moderate
+DCD_moderate_transitions_cp <- c(
+  "Moderate graft DCD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+
+#poor
+DCD_poor_transitions_cp <- c(
+  "Poor graft DCD" = 1 - sum(
+    round(tp_HIV_current_practice, 7),
+    round(tp_HBV_current_practice, 4),
+    round(tp_HCV_current_practice, 5)
+  ),
+  
+  "HIV" = round(tp_HIV_current_practice, 7),
+  
+  "HBV" = round(tp_HBV_current_practice, 4),
+  
+  "HCV" = round(tp_HCV_current_practice, 5)
+  
+)
+```
+
+# Common health states in both arms
+
+## Good graft 
+```{r}
+# DBD SCD
+gg_DBDSCD_transitions <- c(
+  "Good graft DBD SCD" = 1 - sum(
+    round(tp_gm_DBDSCD, 4),
+    round(tp_gp_DBDSCD, 4),
+    round(tp_gd_DBDSCD, 4)
+  ),
+  
+  "Moderate graft DBD SCD" = round(tp_gm_DBDSCD, 4),
+  
+  "Poor graft DBD SCD" = round(tp_gp_DBDSCD, 4),
+  
+  "Death w functioning graft" = round(tp_gd_DBDSCD, 4)
+  
+)
+
+# DBD ECD
+gg_DBDECD_transitions <- c(
+  "Good graft DBD ECD" = 1 - sum(
+    round(tp_gm_DBDECD, 4),
+    round(tp_gp_DBDECD, 4),
+    round(tp_gd_DBDECD, 4)
+  ),
+  
+  "Moderate graft DBD ECD" = round(tp_gm_DBDECD, 4),
+  
+  "Poor graft DBD ECD" = round(tp_gp_DBDECD, 4),
+  
+  "Death w functioning graft" = round(tp_gd_DBDECD, 4)
+  
+)
+
+# DCD
+gg_DCD_transitions <- c(
+  "Good graft DCD" = 1 - sum(
+    round(tp_gm_DCD, 4),
+    round(tp_gp_DCD, 4),
+    round(tp_gd_DCD, 4)
+  ),
+  
+  "Moderate graft DCD" = round(tp_gm_DCD, 4),
+  
+  "Poor graft DCD" = round(tp_gp_DCD, 4),
+  
+  "Death w functioning graft" = round(tp_gd_DCD, 4)
+  
+)
+
+```
+
+## Moderate graft
+```{r}
+# DBD SCD
+mg_DBDSCD_transitions <- c(
+  "Moderate graft DBD SCD" = 1 - sum(
+    round(tp_mp_DBDSCD, 4),
+    round(tp_md_DBDSCD, 4)
+  ),
+  
+  "Poor graft DBD SCD" = round(tp_mp_DBDSCD, 4),
+  
+  "Death w functioning graft" = round(tp_md_DBDSCD, 4)
+  
+)
+
+# DBD ECD
+mg_DBDECD_transitions <- c(
+  "Moderate graft DBD ECD" = 1 - sum(
+    round(tp_mp_DBDECD, 4),
+    round(tp_md_DBDECD, 4)
+  ),
+  
+ "Poor graft DBD ECD" = round(tp_mp_DBDECD, 4),
+  
+  "Death w functioning graft" = round(tp_md_DBDECD, 4)
+  
+)
+
+# DCD
+mg_DCD_transitions <- c(
+  "Moderate graft DCD" = 1 - sum(
+    round(tp_mp_DCD, 4),
+    round(tp_md_DCD, 4)
+  ),
+  
+ "Poor graft DCD" = round(tp_mp_DCD, 4),
+  
+  "Death w functioning graft" = round(tp_md_DCD, 4)
+  
+)
+```
+
+## Poor graft
+```{r}
+# DBD SCD
+pg_DBDSCD_transitions <- c(
+  "Poor graft DBD SCD" = 1 - sum(
+    round(tp_graft_failure, 4),
+    round(tp_peskd_DBDSCD, 4),
+    round(tp_pd_DBDSCD, 4)
+  ),
+  
+  "Off waitlist" = round(tp_graft_failure, 4),
+  
+  "Death after graft failure" = round(tp_peskd_DBDSCD, 4),
+  
+  "Death w functioning graft" = round(tp_pd_DBDSCD, 4)
+  
+)
+
+# DBD ECD
+pg_DBDECD_transitions <- c(
+  "Poor graft DBD ECD" = 1 - sum(
+    round(tp_graft_failure, 4),
+    round(tp_peskd_DBDECD, 4),
+    round(tp_pd_DBDECD, 4)
+  ),
+  
+  "Off waitlist" = round(tp_graft_failure, 4),
+  
+  "Death after graft failure" = round(tp_peskd_DBDECD, 4),
+  
+  "Death w functioning graft" = round(tp_pd_DBDECD, 4)
+  
+)
+
+# DCD
+pg_DCD_transitions <- c(
+  "Poor graft DCD" = 1 - sum(
+    round(tp_graft_failure, 4),
+    round(tp_peskd_DCD, 4),
+    round(tp_pd_DCD, 4)
+  ),
+  
+  "Off waitlist" = round(tp_graft_failure, 4),
+  
+  "Death after graft failure" = round(tp_peskd_DCD, 4),
+  
+  "Death w functioning graft" = round(tp_pd_DCD, 4)
+  
+)
+```
+
+## Off waitlist
+```{r}
+off_waitlist_transitions <- c(
+  "On waitlist" = round(tp_back_on_waitlist, 3),
+  "Off waitlist" = 1 - sum(round(tp_back_on_waitlist, 3), n_death_off_waitlist),
+  "Death off waitlist" = n_death_off_waitlist
+)
+```
+
+## HIV
+```{r}
+HIV_transitions <- c(
+  "HIV" = round(1 - n_death_functioning_graft, 3),
+  "Death w functioning graft" = n_death_functioning_graft
+)
+```
+
+## HBV
+```{r}
+HBV_transitions <- c(
+  "HBV" = 1 - sum(
+    round(tp_chb_cc_hepB, 5),
+    round(tp_chb_hcc, 7),
+    round(tp_chb_sAgloss_hepB, 4),
+    n_death_functioning_graft
+  ),
+  
+  "Hep B Comp cirr" =  round(tp_chb_cc_hepB, 5),
+  
+  "Hep B HCC" = round(tp_chb_hcc, 7),
+  
+  "Spon clearance" = round(tp_chb_sAgloss_hepB, 4),
+  
+  "Death w functioning graft" = n_death_functioning_graft
+)
+```
+
+## HCV
+```{r}
+HCV_transitions <- c(
+  "HCV" = 1 - sum(n_death_functioning_graft, round(tp_chc_cc_hepC, 5), tp_SVR),
+  
+  "Hep C Comp cirr" =   round(tp_chc_cc_hepC, 5),
+  
+  "SVR" = round(tp_SVR, 3),
+  
+  "Death w functioning graft" = n_death_functioning_graft
+)
+```
+
+## Hep B Comp cirr
+```{r}
+HBV_comp_cir_transitions <- c(
+  "Hep B Comp cirr" = 1 - sum(
+    n_death_functioning_graft,
+    round(tp_death_cc_hepB, 5),
+    round(tp_cc_dc_hepB, 4),
+    round(tp_cc_hcc_hepB, 4)
+  ),
+  
+  "Hep B Decomp cirr" =  round(tp_cc_dc_hepB, 4),
+  
+  "Hep B HCC" =   round(tp_cc_hcc_hepB, 4),
+  
+  "Death w functioning graft" = n_death_functioning_graft,
+  
+  "Death end stage liver" =  round(tp_death_cc_hepB, 5)
+)
+```
+
+## Hep B Decomp cirr
+```{r}
+HBV_decomp_cir_transitions <- c(
+  "Hep B Decomp cirr" = 1 - sum(
+    n_death_functioning_graft,
+    round(tp_death_dc_hepB, 4),
+    round(tp_dc_hcc_hepB, 4),
+    round(tp_dc_lt_hepB, 4)
+  ),
+  
+  "Hep B HCC" =   round(tp_dc_hcc_hepB, 4),
+  
+  "Liver transplant 3" =  round(tp_dc_lt_hepB, 4),
+  
+  "Death w functioning graft" = n_death_functioning_graft,
+  
+  "Death end stage liver" =  round(tp_death_dc_hepB, 4)
+)
+```
+
+## Hep B HCC
+```{r}
+HBV_HCC_transitions <- c(
+  "Hep B HCC" =  1 - sum(
+    n_death_functioning_graft,
+    round(tp_death_hcc_hepB, 4),
+    round(tp_hcc_lt_hepB, 4)
+  ),
+  
+  "Liver transplant 3" = round(tp_hcc_lt_hepB, 4),
+  
+  "Death w functioning graft" = n_death_functioning_graft,
+  
+  "Death end stage liver" =  round(tp_death_hcc_hepB, 4)
+)
+```
+
+## Spon clearance
+```{r}
+Spon_clearance_transitions <- c(
+  "Spon clearance" = 1 - n_death_functioning_graft,
+  
+  "Death w functioning graft" = n_death_functioning_graft
+)
+```
+
+## Hep C Comp cirr
+```{r}
+HCV_comp_cirr_transitions <- c(
+  "Hep C Comp cirr" = 1 - sum(
+    n_death_functioning_graft,
+    round(tp_cc_dc_hepC, 4),
+    round(tp_cc_hcc_hepC, 4)
+  ),
+  
+  "Hep C Decomp cirr" =  round(tp_cc_dc_hepC, 4),
+  
+  "Hep C HCC" = round(tp_cc_hcc_hepC, 4),
+  
+  "Death w functioning graft" = n_death_functioning_graft
+  
+)
+```
+
+## Hep C Decomp cirr
+```{r}
+HCV_decomp_cirr_transitions <- c(
+  "Hep C Decomp cirr" = 1 - sum(
+    n_death_functioning_graft,
+    round(tp_death_dc_hepC, 4),
+    round(tp_dc_hcc_hepC, 4),
+    round(tp_dc_lt_hepC, 4)
+  ),
+  
+  "Hep C HCC" = round(tp_dc_hcc_hepC, 4),
+  
+  "Liver transplant 3" = round(tp_dc_lt_hepC, 4),
+  
+  "Death w functioning graft" =  n_death_functioning_graft,
+  
+  "Death end stage liver" = round(tp_death_dc_hepC, 4)
+)
+```
+
+## Hep C HCC
+```{r}
+HCV_hcc_transitions <- c(
+  "Hep C HCC" = 1 - sum(
+    n_death_functioning_graft,
+    round(tp_death_hcc_hepC, 4),
+    round(tp_hcc_lt_hepC, 4)
+  ),
+  
+  "Liver transplant 3" = round(tp_hcc_lt_hepC, 4),
+  
+  "Death w functioning graft" = n_death_functioning_graft,
+  
+  "Death end stage liver" =  round(tp_death_hcc_hepC, 4)
+)
+```
+
+## SVR
+```{r}
+SVR_transitions <- c(
+  "SVR" = 1 - n_death_functioning_graft,
+  
+  "Death w functioning graft" = n_death_functioning_graft
+)
+```
+
+## Liver transplant 
+```{r}
+# 3 months
+
+liver3_transitions <- c(
+  "Liver transplant 6" = 1 - round(tp_death_LT, 4),
+  
+  "Death end stage liver" = round(tp_death_LT, 4)
+)
+
+
+# 6 months
+
+liver6_transitions <- c(
+  "Liver transplant 9" = 1 - round(tp_death_LT, 4),
+  
+  "Death end stage liver" = round(tp_death_LT, 4)
+)
+
+# 9 months
+
+liver9_transitions <- c(
+  "Liver transplant 12" = 1 - round(tp_death_LT, 4),
+  
+  "Death end stage liver" = round(tp_death_LT, 4)
+)
+
+# yr 2
+
+liver_yr2_transitions <- c(
+  "Liver transplant yr 2" = 1 - round(tp_death_LT, 4),
+  
+  "Death end stage liver" = round(tp_death_LT, 4)
+)
+
+```
+
+## Death 
+```{r}
+death_transitions <- c(
+  "Death on waitlist" = 1,
+  
+  "Death off waitlist" = 1,
+  
+  "Death after graft failure" = 1,
+  
+  "Death w functioning graft" = 1,
+  
+  "Death end stage liver" = 1
+  
+)
+```
+
+
+# All transitions - proposed practice
+```{r}
+all_transitions <- list(
+  "On waitlist" = on_waitlist_transitions,
+  "DBD SCD good" = DBD_SCD_good_transitions,
+  "DBD SCD moderate" = DBD_SCD_moderate_transitions,
+  "DBD SCD poor" = DBD_SCD_poor_transitions,
+  "DBD ECD good" = DBD_ECD_good_transitions,
+  "DBD ECD moderate" = DBD_ECD_moderate_transitions,
+  "DBD ECD poor" = DBD_ECD_poor_transitions,
+  "DCD good" = DCD_good_transitions,
+  "DCD moderate" = DCD_moderate_transitions,
+  "DCD poor" = DCD_poor_transitions,
+  "Good graft DBD SCD" = gg_DBDSCD_transitions,
+  "Good graft DBD ECD" = gg_DBDECD_transitions,
+  "Good graft DCD" = gg_DCD_transitions,
+  "Moderate graft DBD SCD" = mg_DBDSCD_transitions,
+  "Moderate graft DBD ECD" = mg_DBDECD_transitions,
+  "Moderate graft DCD" = mg_DCD_transitions,
+  "Poor graft DBD SCD" = pg_DBDSCD_transitions,
+  "Poor graft DBD ECD" = pg_DBDECD_transitions,
+  "Poor graft DCD" = pg_DCD_transitions,
+  "Off waitlist" = off_waitlist_transitions,
+  "HIV" = HIV_transitions,
+  "HBV" = HBV_transitions,
+  "HCV" = HCV_transitions,
+  "Hep B Comp cirr" = HBV_comp_cir_transitions,
+  "Hep B Decomp cirr" = HBV_decomp_cir_transitions,
+  "Hep B HCC" = HBV_HCC_transitions,
+  "Spon clearance" = Spon_clearance_transitions,
+  "Hep C Comp cirr" = HCV_comp_cirr_transitions,
+  "Hep C Decomp cirr" = HCV_decomp_cirr_transitions,
+  "Hep C HCC" = HCV_hcc_transitions,
+  "SVR" = SVR_transitions,
+  "Liver transplant 3" = liver3_transitions,
+  "Liver transplant 6" = liver6_transitions,
+  "Liver transplant 9" = liver9_transitions,
+  "Liver transplant 12" = liver9_transitions, # Assuming this was meant to be "liver12_transitions" if defined
+  "Liver transplant yr 2" = liver_yr2_transitions,
+  "Death" = death_transitions # Assuming all death states have the same transition probabilities
+)
+```
+
+# Probability function for the proposed practice
+
+```{r}
+Probs_pp <- function(current_state, all_transitions) {
+ v.p.it <- rep(0, length(v_names_health_states))
+  names(v.p.it) <- v_names_health_states
+  
+  if(current_state %in% names(all_transitions)) {
+    transitions_for_state <- all_transitions[[current_state]]
+    for(target_state in names(transitions_for_state)) {
+      v.p.it[target_state] <- transitions_for_state[target_state]
+    }
+  } else {
+    # Assuming terminal states are correctly recognized
+    if(grepl("Death", current_state)) {
+      v.p.it[current_state] <- 1  # Ensure terminal states self-transition
+    } else {
+      warning(paste("No transitions defined for state:", current_state))
+    }
+  }
+  
+  return(v.p.it)
+}
+```
+
+
+# All transitions - current
+```{r}
+all_transitions_cp <- list(
+  "On waitlist" = on_waitlist_transitions_cp,
+  "DBD SCD good" = DBD_SCD_good_transitions_cp,
+  "DBD SCD moderate" = DBD_SCD_moderate_transitions_cp,
+  "DBD SCD poor" = DBD_SCD_poor_transitions_cp,
+  "DBD ECD good" = DBD_ECD_good_transitions_cp,
+  "DBD ECD moderate" = DBD_ECD_moderate_transitions_cp,
+  "DBD ECD poor" = DBD_ECD_poor_transitions_cp,
+  "DCD good" = DCD_good_transitions_cp,
+  "DCD moderate" = DCD_moderate_transitions_cp,
+  "DCD poor" = DCD_poor_transitions_cp,
+  "Good graft DBD SCD" = gg_DBDSCD_transitions,
+  "Good graft DBD ECD" = gg_DBDECD_transitions,
+  "Good graft DCD" = gg_DCD_transitions,
+  "Moderate graft DBD SCD" = mg_DBDSCD_transitions,
+  "Moderate graft DBD ECD" = mg_DBDECD_transitions,
+  "Moderate graft DCD" = mg_DCD_transitions,
+  "Poor graft DBD SCD" = pg_DBDSCD_transitions,
+  "Poor graft DBD ECD" = pg_DBDECD_transitions,
+  "Poor graft DCD" = pg_DCD_transitions,
+  "Off waitlist" = off_waitlist_transitions,
+  "HIV" = HIV_transitions,
+  "HBV" = HBV_transitions,
+  "HCV" = HCV_transitions,
+  "Hep B Comp cirr" = HBV_comp_cir_transitions,
+  "Hep B Decomp cirr" = HBV_decomp_cir_transitions,
+  "Hep B HCC" = HBV_HCC_transitions,
+  "Spon clearance" = Spon_clearance_transitions,
+  "Hep C Comp cirr" = HCV_comp_cirr_transitions,
+  "Hep C Decomp cirr" = HCV_decomp_cirr_transitions,
+  "Hep C HCC" = HCV_hcc_transitions,
+  "SVR" = SVR_transitions,
+  "Liver transplant 3" = liver3_transitions,
+  "Liver transplant 6" = liver6_transitions,
+  "Liver transplant 9" = liver9_transitions,
+  "Liver transplant 12" = liver9_transitions, # Assuming this was meant to be "liver12_transitions" if defined
+  "Liver transplant yr 2" = liver_yr2_transitions,
+  "Death" = death_transitions # Assuming all death states have the same transition probabilities
+)
+```
+
+# Probability function for the current practice
+
+```{r}
+Probs_cp <- function(current_state, all_transitions_cp) {
+ v.p.it <- rep(0, length(v_names_health_states))
+  names(v.p.it) <- v_names_health_states
+  
+  if(current_state %in% names(all_transitions_cp)) {
+    transitions_for_state <- all_transitions_cp[[current_state]]
+    for(target_state in names(transitions_for_state)) {
+      v.p.it[target_state] <- transitions_for_state[target_state]
+    }
+  } else {
+    # Assuming terminal states are correctly recognized
+    if(grepl("Death", current_state)) {
+      v.p.it[current_state] <- 1  # Ensure terminal states self-transition
+    } else {
+      warning(paste("No transitions defined for state:", current_state))
+    }
+  }
+  
+  return(v.p.it)
+}
+
+```
+
+
+# Cost function for proposed practice 
+
+```{r}
+Costs_pp <- function(M_it, previous_state = NULL, Trt = FALSE) {
+    c.it <- 0  # Initialize cost
+  
+   if (M_it == "On waitlist") {
+        c.it <- sum((pro_HD * c_in_centre_haemodialysis$Value),
+                     (pro_PD * c_peritoneal_dialysis$Value),
+                     (pro_HHD * c_home_haemodialysis$Value)
+    ) * cycle_length
+
+        # Check if previous_state is not NA or NULL and if transition occurred from "Off waitlist"
+        if (!is.na(previous_state) && !is.null(previous_state) && previous_state == "Off waitlist") {
+            c.it <- c.it + c_work_up_transplant_waitlist$Value  # cost for transplant workup for getting back on waitlist
+        }
+    }
+
+  
+    if (M_it == "DBD SCD good") {
+      c.it <-
+        c_kidney_transplant_year_1 + (
+          sum(
+            c_kidney_transplant_year_1,
+            c_follow_up$Value,
+            c_diagosis_proposed_policy,
+            c_proph_hepB) * round(
+            per_effect_increased_risk_behaviours * (1 - pro_DBDSCD_mg - pro_DBDSCD_pg - tp_graft_failure),
+            4
+          )
+        )
+    } 
+  
+  if (M_it == "DBD SCD moderate") {
+    c.it <-
+        c_kidney_transplant_year_1 + (
+          sum(
+            c_kidney_transplant_year_1,
+            c_follow_up$Value,
+            c_diagosis_proposed_policy,
+            c_proph_hepB) * round(per_effect_increased_risk_behaviours * pro_DBDSCD_mg, 4)
+      )
+    
+  } 
+  
+  if (M_it == "DBD SCD poor") {
+    c.it <-
+        c_kidney_transplant_year_1 + (
+          sum(
+            c_kidney_transplant_year_1,
+            c_follow_up$Value,
+            c_diagosis_proposed_policy,
+            c_proph_hepB) * round(per_effect_increased_risk_behaviours * pro_DBDSCD_pg, 4)
+      )
+    
+  } 
+  
+  if (M_it == "DBD ECD good") {
+    c.it <- c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DBD ECD moderate") {
+    c.it <- c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "DBD ECD poor") {
+    c.it <- c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "DCD good") {
+    c.it <- c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "DCD moderate") {
+    c.it <- c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "DCD poor") {
+    c.it <- c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "Good graft DBD SCD") {
+    c.it <-  c_good_graft_post_transplant$Value * cycle_length
+    
+  } 
+  
+  if (M_it == "Good graft DBD ECD") {
+    c.it <-  c_good_graft_post_transplant$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Good graft DCD") {
+    c.it <-  c_good_graft_post_transplant$Value * cycle_length
+    
+    
+  } 
+  
+  if (M_it == "Moderate graft DBD SCD") {
+    c.it <-  c_moderate_graft_post_transplant$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Moderate graft DBD ECD") {
+    c.it <- c_moderate_graft_post_transplant$Value * cycle_length
+    
+  } 
+  
+  if (M_it == "Moderate graft DCD") {
+    c.it <- c_moderate_graft_post_transplant$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Poor graft DBD SCD") {
+    c.it <-  c_poor_graft_post_transplant$Value * cycle_length
+    
+    
+  } 
+  
+  if (M_it == "Poor graft DBD ECD") {
+    c.it <-  c_poor_graft_post_transplant$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Poor graft DCD") {
+    c.it <-  c_poor_graft_post_transplant$Value * cycle_length
+    
+  } 
+  
+  if (M_it == "Off waitlist") {
+    c.it <- sum((pro_HD * c_in_centre_haemodialysis$Value),
+                (pro_PD * c_peritoneal_dialysis$Value),
+                (pro_HHD * c_home_haemodialysis$Value)
+    ) * cycle_length
+    
+    
+  }
+  
+  if (M_it == "HIV") {
+      c.it <-
+        (c_remaining_HIV) * cycle_length
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + as.numeric(c_diagnosing_HIV$Value)
+      }
+    }
+  
+    if (M_it == "HBV") {
+      c.it <- c_chronic_hepB$Value * cycle_length
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + as.numeric(c_diagnosing_hepB$Value)
+      }
+    }
+    
+    
+    if (M_it == "HCV") {
+      c.it <-
+        (c_chronic_HCV$Value) * cycle_length
+      
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) && previous_state == "On waitlist") {
+        c.it <-
+          c.it +  c_kidney_transplant_year_1 +
+          c_follow_up$Value + c_treating_hepC
+        
+      }
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + c_treating_hepC  
+      }
+      
+      
+    }
+
+  
+  if (M_it == "Hep B Comp cirr") {
+    c.it <- c_compensated_cirrhosis_hepB$Value * cycle_length
+    
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HBV") {
+        c.it <- c.it + c_one_off_transition_to_CC$Value
+      }
+    
+  }
+  
+  if (M_it == "Hep B Decomp cirr") {
+    c.it <- c_decompensated_cirrhosis_hepB$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Hep B HCC") {
+    c.it <-  c_hepatocellular_carcinoma_hepB$Value * cycle_length
+   
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% c("HBV", "Hep B Comp cirr", "Hep B Decomp cirr")) {
+        c.it <- c.it + c_one_off_transition_to_hcc$Value
+      }
+     
+  }
+  
+  if (M_it == "Spon clearance") {
+    c.it <- c_chronic_hepB$Value * cycle_length
+    
+  } 
+  
+  if (M_it == "Hep C Comp cirr") {
+    c.it <- c_compensated_cirrhosis_hepC$Value * cycle_length
+    
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HCV") {
+        c.it <- c.it + c_one_off_transition_to_CC$Value
+      }
+  }
+  
+  if (M_it == "Hep C Decomp cirr") {
+    c.it <- c_decompensated_cirrhosis_hepC$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Hep C HCC") {
+    c.it <- c_hepatocellular_carcinoma_hepC$Value * cycle_length
+    
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% c("Hep C Comp cirr", "Hep C Decomp cirr")) {
+        c.it <- c.it + c_one_off_transition_to_hcc$Value
+      }
+  }
+  
+  if (M_it == "SVR") {
+    c.it <-  c_SVR_hepC$Value * cycle_length
+    
+    if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HCV") {
+        c.it <- c.it + c_SVR_hepC$Value
+      }
+    
+  } 
+  
+  if (M_it == "Liver transplant 3") {
+    c.it <-  cycle_length * (c_liver_transplant_year_1$Value)
+    
+  }
+  
+  if (M_it == "Liver transplant 6") {
+    c.it <- cycle_length * (c_liver_transplant_year_1$Value)
+    
+  }
+  if (M_it == "Liver transplant 9") {
+    c.it <- cycle_length * (c_liver_transplant_year_1$Value)
+    
+    
+  }
+  
+  if (M_it == "Liver transplant 12") {
+    c.it <- cycle_length * (c_liver_transplant_year_1$Value)
+    
+    
+  } 
+  
+  if (M_it == "Liver transplant yr 2") {
+    c.it <- cycle_length * (c_liver_transplant_year_2$Value)
+    
+    
+  }
+  
+  if (M_it == "Death on waitlist") {
+    c.it <- 0  # Assuming no cost for "Death on waitlist"
+  }
+  
+  if (M_it == "Death off waitlist") {
+    c.it <- 0  # Assuming no cost for "Death off waitlist"
+  }
+  
+  if (M_it == "Death after graft failure") {
+    c.it <- 0  # Assuming no cost for "Death after graft failure"
+  }
+  
+  if (M_it == "Death w functioning graft") {
+    c.it <- 0  # Assuming no cost for "Death w functioning graft"
+  }
+  
+  if (M_it == "Death end stage liver") {
+    c.it <- 0  # Assuming no cost for "Death end stage liver"
+  }
+  
+  return(c.it)
+}
+
+```
+
+
+# Cost function for current practice
+
+```{r}
+Costs_cp <- function(M_it, previous_state = NULL, Trt = FALSE) {
+    c.it <- 0  # Initialize cost
+ 
+  
+   if (M_it == "On waitlist") {
+        c.it <- sum((pro_HD * c_in_centre_haemodialysis$Value),
+                     (pro_PD * c_peritoneal_dialysis$Value),
+                     (pro_HHD * c_home_haemodialysis$Value)
+    ) * cycle_length
+
+        # Check if previous_state is not NA or NULL and if transition occurred from "Off waitlist"
+        if (!is.na(previous_state) && !is.null(previous_state) && previous_state == "Off waitlist") {
+            c.it <- c.it + c_work_up_transplant_waitlist$Value  # cost for transplant workup for getting back on waitlist
+        }
+    }
+
+  
+    if (M_it == "DBD SCD good") {
+      c.it <-
+        c_kidney_transplant_year_1
+    } 
+  
+  if (M_it == "DBD SCD moderate") {
+    c.it <-
+      c_kidney_transplant_year_1  
+    
+  } 
+  
+  if (M_it == "DBD SCD poor") {
+    c.it <-
+      c_kidney_transplant_year_1 
+  } 
+  
+  if (M_it == "DBD ECD good") {
+    c.it <-
+      c_kidney_transplant_year_1 
+    
+  } 
+  
+  if (M_it == "DBD ECD moderate") {
+    c.it <-
+     c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DBD ECD poor") {
+    c.it <-
+      c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DCD good") {
+    c.it <-
+      c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DCD moderate") {
+    c.it <-
+      c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DCD poor") {
+    c.it <-
+      c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "Good graft DBD SCD") {
+    c.it <-  c_good_graft_post_transplant$Value * cycle_length
+    
+  } 
+  
+  if (M_it == "Good graft DBD ECD") {
+    c.it <-  c_good_graft_post_transplant$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Good graft DCD") {
+    c.it <-  c_good_graft_post_transplant$Value * cycle_length
+    
+    
+  } 
+  
+  if (M_it == "Moderate graft DBD SCD") {
+    c.it <-  c_moderate_graft_post_transplant$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Moderate graft DBD ECD") {
+    c.it <- c_moderate_graft_post_transplant$Value * cycle_length
+    
+  } 
+  
+  if (M_it == "Moderate graft DCD") {
+    c.it <- c_moderate_graft_post_transplant$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Poor graft DBD SCD") {
+    c.it <-  c_poor_graft_post_transplant$Value * cycle_length
+    
+    
+  } 
+  
+  if (M_it == "Poor graft DBD ECD") {
+    c.it <-  c_poor_graft_post_transplant$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Poor graft DCD") {
+    c.it <-  c_poor_graft_post_transplant$Value * cycle_length
+    
+  } 
+  
+  if (M_it == "Off waitlist") {
+    c.it <- sum((pro_HD * c_in_centre_haemodialysis$Value),
+                (pro_PD * c_peritoneal_dialysis$Value),
+                (pro_HHD * c_home_haemodialysis$Value)
+    ) * cycle_length
+    
+    
+  }
+  
+  
+    if (M_it == "HIV") {
+      c.it <- c_remaining_HIV * cycle_length
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + as.numeric(c_diagnosing_HIV$Value)
+      }
+    }
+  
+    if (M_it == "HBV") {
+      c.it <- c_chronic_hepB$Value * cycle_length
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + as.numeric(c_diagnosing_hepB$Value)
+      }
+    }
+    
+    
+    if (M_it == "HCV") {
+      c.it <-
+        (c_chronic_HCV$Value) * cycle_length
+      
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it +  c_treating_hepC 
+      }
+      
+      
+    }
+
+  
+  if (M_it == "Hep B Comp cirr") {
+    c.it <- c_compensated_cirrhosis_hepB$Value * cycle_length
+    
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HBV") {
+        c.it <- c.it + c_one_off_transition_to_CC$Value
+      }
+    
+  }
+  
+  if (M_it == "Hep B Decomp cirr") {
+    c.it <- c_decompensated_cirrhosis_hepB$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Hep B HCC") {
+    c.it <-  c_hepatocellular_carcinoma_hepB$Value * cycle_length
+   
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% c("HBV", "Hep B Comp cirr", "Hep B Decomp cirr")) {
+        c.it <- c.it + c_one_off_transition_to_hcc$Value
+      }
+     
+  }
+  
+  if (M_it == "Spon clearance") {
+    c.it <- c_chronic_hepB$Value * cycle_length
+    
+  } 
+  
+  if (M_it == "Hep C Comp cirr") {
+    c.it <- c_compensated_cirrhosis_hepC$Value * cycle_length
+    
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HCV") {
+        c.it <- c.it + c_one_off_transition_to_CC$Value
+      }
+  }
+  
+  if (M_it == "Hep C Decomp cirr") {
+    c.it <- c_decompensated_cirrhosis_hepC$Value * cycle_length
+    
+  }
+  
+  if (M_it == "Hep C HCC") {
+    c.it <- c_hepatocellular_carcinoma_hepC$Value * cycle_length
+    
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% c("Hep C Comp cirr", "Hep C Decomp cirr")) {
+        c.it <- c.it + c_one_off_transition_to_hcc$Value
+      }
+  }
+  
+  if (M_it == "SVR") {
+    c.it <-  c_SVR_hepC$Value * cycle_length
+    
+    if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HCV") {
+        c.it <- c.it + c_SVR_hepC$Value
+      }
+    
+  } 
+  
+  if (M_it == "Liver transplant 3") {
+    c.it <-  cycle_length * (cost_liver_transplant_yr_1$Value)
+    
+  }
+  
+  if (M_it == "Liver transplant 6") {
+    c.it <- cycle_length * (cost_liver_transplant_yr_1$Value)
+    
+  }
+  if (M_it == "Liver transplant 9") {
+    c.it <- cycle_length * (cost_liver_transplant_yr_1$Value)
+    
+    
+  }
+  
+  if (M_it == "Liver transplant 12") {
+    c.it <- cycle_length * (cost_liver_transplant_yr_1$Value)
+    
+    
+  } 
+  
+  if (M_it == "Liver transplant yr 2") {
+    c.it <- cycle_length * (cost_liver_transplant_yr_2$Value)
+    
+    
+  }
+  
+  if (M_it == "Death on waitlist") {
+    c.it <- 0  # Assuming no cost for "Death on waitlist"
+  }
+  
+  if (M_it == "Death off waitlist") {
+    c.it <- 0  # Assuming no cost for "Death off waitlist"
+  }
+  
+  if (M_it == "Death after graft failure") {
+    c.it <- 0  # Assuming no cost for "Death after graft failure"
+  }
+  
+  if (M_it == "Death w functioning graft") {
+    c.it <- 0  # Assuming no cost for "Death w functioning graft"
+  }
+  
+  if (M_it == "Death end stage liver") {
+    c.it <- 0  # Assuming no cost for "Death end stage liver"
+  }
+  
+  return(c.it)
+}
+
+```
+
+# Health outcomes
+```{r}
+Effs <- function(M_it, previous_state = NULL, Trt = FALSE, cl = 0.25) {
+
+  u.it <- 0 # by default the utility for everyone is zero
+   
+  # Assign qalys based on the health state
+  if (M_it == "On waitlist") {
+    u.it <- u_on_waitlist_dialysis$Value
+    
+  }
+  
+  
+  if (M_it == "DBD SCD good") {
+    u.it <- u_transplantation_gg_function$Value
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it + u_transplantation_gg_function$Value
+    }
+  }
+
+  
+  
+  if (M_it == "DBD SCD moderate") {
+    u.it <- u_transplantation_mg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it + u_transplantation_mg_function$Value
+    }
+  }
+  
+  if (M_it == "DBD SCD poor") {
+    u.it <- u_transplantation_pg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it + u_transplantation_pg_function$Value
+    }
+  }
+  
+   if (M_it == "DBD ECD good") {
+    u.it <- u_transplantation_gg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  u_transplantation_gg_function$Value
+    }
+  }
+  
+  if (M_it == "DBD ECD moderate") {
+    u.it <- u_transplantation_mg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  u_transplantation_mg_function$Value
+    }
+  }
+  
+  if (M_it == "DBD ECD poor") {
+    u.it <- u_transplantation_pg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  u_transplantation_pg_function$Value
+    }
+  }
+  
+   if (M_it == "DCD good") {
+    u.it <- u_transplantation_gg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  u_transplantation_gg_function$Value
+    }
+  } 
+  
+  if (M_it == "DCD moderate") {
+    u.it <- u_transplantation_mg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  u_transplantation_mg_function$Value
+    }
+  } 
+  
+  if (M_it == "DCD poor") {
+    u.it <- u_transplantation_pg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  u_transplantation_pg_function$Value
+    }
+  } 
+  
+  if (M_it == "Good graft DBD SCD") {
+    u.it <- u_transplantation_gg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "DBD SCD good") {
+      u.it <- u.it +  u_transplantation_gg_function$Value
+    }
+  } 
+  
+  if (M_it == "Good graft DBD ECD") {
+    u.it <- u_transplantation_gg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "DBD ECD good") {
+      u.it <- u.it +  u_transplantation_gg_function$Value
+    }
+  } 
+  
+  if (M_it == "Good graft DCD") {
+    u.it <- u_transplantation_gg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "DCD good") {
+      u.it <- u.it +  u_transplantation_gg_function$Value
+    }
+  } 
+  
+  if (M_it == "Moderate graft DBD SCD") {
+    u.it <- u_transplantation_mg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in% c("Good graft DBD SCD", "DBD SCD moderate")) {
+      u.it <- u.it +  u_transplantation_mg_function$Value
+    }
+  }
+  
+  if (M_it == "Moderate graft DBD ECD") {
+    u.it <- u_transplantation_mg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in%  c("Good graft DBD ECD", "DBD ECD moderate")) {
+      u.it <- u.it +  u_transplantation_mg_function$Value
+    }
+  }
+  
+  if (M_it == "Moderate graft DCD") {
+    u.it <- u_transplantation_mg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state%in% c("Good graft DCD", "DCD moderate")) {
+      u.it <- u.it +  u_transplantation_mg_function$Value
+    }
+  }
+  
+  
+  if (M_it == "Poor graft DBD SCD") {
+    u.it <- u_transplantation_pg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in% c("Good graft DBD SCD", "Moderate graft DBD SCD", "DBD SCD poor")) {
+      u.it <- u.it +  u_transplantation_pg_function$Value
+    }
+  } 
+  
+  if (M_it == "Poor graft DBD ECD") {
+    u.it <- u_transplantation_pg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in% c("Good graft DBD ECD", "Moderate graft DBD ECD","DBD ECD poor")) {
+      u.it <- u.it +  u_transplantation_pg_function$Value
+    }
+  } 
+  
+  if (M_it == "Poor graft DCD") {
+    u.it <- u_transplantation_pg_function$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in% c("Good graft DCD", "Moderate graft DCD","DCD poor")) {
+      u.it <- u.it +  u_transplantation_pg_function$Value
+    }
+  } 
+  
+  if (M_it == "Off waitlist") {
+    u.it <- u_on_waitlist_dialysis$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  u_on_waitlist_dialysis$Value
+    }
+  }  
+  
+
+  if (M_it == "HIV") {
+    u.it <- u_HIV$Value
+    
+    # Define the states from which transition might add additional costs
+    valid_states <- c(
+      "DBD SCD good",
+      "DBD SCD moderate",
+      "DBD SCD poor",
+      "DBD ECD good",
+      "DBD ECD moderate",
+      "DBD ECD poor",
+      "DCD good",
+      "DCD moderate",
+      "DCD poor"
+    )
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% valid_states) {
+      u.it <- u.it +  u_HIV$Value
+    }
+    
+  } 
+  
+  
+  if (M_it == "HBV") {
+    u.it <- u_CHB_hepB$Value
+    
+    # Define the states from which transition might add additional costs
+    valid_states <- c(
+      "DBD SCD good",
+      "DBD SCD moderate",
+      "DBD SCD poor",
+      "DBD ECD good",
+      "DBD ECD moderate",
+      "DBD ECD poor",
+      "DCD good",
+      "DCD moderate",
+      "DCD poor"
+    )
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% valid_states) {
+      u.it <- u.it + u_CHB_hepB$Value
+    }
+    
+  } 
+  
+  if (M_it == "HCV") {
+    u.it <- u_CHC_hepC$Value
+    
+    # Define the states from which transition might add additional costs
+    valid_states <- c(
+      "DBD SCD good",
+      "DBD SCD moderate",
+      "DBD SCD poor",
+      "DBD ECD good",
+      "DBD ECD moderate",
+      "DBD ECD poor",
+      "DCD good",
+      "DCD moderate",
+      "DCD poor"
+    )
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% valid_states) {
+      u.it <- u.it + u_CHC_hepC$Value
+    }
+    
+  } 
+  
+  if (M_it == "Hep B Comp cirr") {
+    u.it <- u_CC_hepB$Value
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "HBV") {
+      u.it <- u.it +  u_CC_hepB$Value
+    }
+    
+  } 
+  
+  
+  if (M_it == "Hep B Decomp cirr") {
+    u.it <- u_DC_hepB$Value
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "Hep B Comp cirr") {
+      u.it <- u.it +  u_DC_hepB$Value
+    }
+  } 
+  
+  
+  if (M_it == "Hep B HCC") {
+    u.it <- u_HCC_hepB$Value
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% c("HBV", "Hep B Comp cirr", "Hep B Decomp cirr")) {
+      u.it <- u.it +  u_HCC_hepB$Value
+    }
+  } 
+  
+  if (M_it == "Spon clearance") {
+    u.it <- u_sag_clearance$Value
+     # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "HBV") {
+      u.it <- u.it +  u_sag_clearance$Value
+    }
+  } 
+  
+  if (M_it == "Hep C Comp cirr") {
+    u.it <- u_CC_hepC$Value
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "HCV") {
+      u.it <- u.it +  u_CC_hepC$Value
+    }
+  } 
+  
+  if (M_it == "Hep C Decomp cirr") {
+    u.it <- u_DC_hepC$Value
+       # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "Hep C Comp cirr") {
+      u.it <- u.it +  u_DC_hepC$Value
+    }
+  } 
+  
+  if (M_it == "Hep C HCC") {
+    u.it <- u_HCC_hepC$Value
+           # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% c("Hep C Comp cirr", "Hep C Decomp cirr")) {
+      u.it <- u.it +  u_HCC_hepC$Value
+    }
+  } 
+  
+  if (M_it == "SVR") {
+    u.it <- u_SVR_hepC$Value
+        # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "HCV") {
+      u.it <- u.it + u_SVR_hepC$Value
+    } 
+  } 
+  
+  if (M_it == "Liver transplant 3") {
+    u.it <- u_liver_transplant_year_1$Value
+              # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% c("Hep B HCC", "Hep C HCC", "Hep C Decomp cirr", "Hep B Decomp cirr")) {
+      u.it <- u.it + u_liver_transplant_year_1$Value
+    } 
+  } 
+  
+  if (M_it == "Liver transplant 6") {
+    u.it <-  u_liver_transplant_year_1$Value
+    
+  } 
+  
+  if (M_it == "Liver transplant 9") {
+    u.it <-  u_liver_transplant_year_1$Value
+    
+  } 
+  
+  if (M_it == "Liver transplant 12") {
+    u.it <-  u_liver_transplant_year_1$Value
+    
+  } 
+  
+  if (M_it == "Liver transplant yr 2") {
+    u.it <- u_liver_transplant_year_2$Value
+    
+  } 
+  
+  
+   if (M_it == "Death on waitlist") {
+    u.it <- 0
+    
+   } 
+  
+  
+   if (M_it == "Death off waitlist") {
+    u.it <- 0
+    
+   } 
+  
+  if (M_it == "Death after graft failure") {
+    u.it <- 0
+    
+  } 
+  
+  if (M_it == "Death w functioning graft") {
+    u.it <- 0
+    
+  } 
+  
+  if (M_it == "Death end stage liver") {
+    u.it <- 0
+    
+  } 
+  
+  #  # Check for specific events that incur additional costs
+  # if (event_qaly_applied_on) {
+  #   additional_qaly <- 0.21  # Example additional cost for transitioning to HCV from "On waitlist"
+  # }
+  
+  cycle_qaly <- u.it * cl
+  
+  return(cycle_qaly)
+}
+
+```
+
+# Run simulation 
+
+```{r}
+p = Sys.time()
+
+# sim_shift_clinical_practice <-
+sim_shift_clinical_practice <- Microsim_pp(v_m_on_waitlist, n_c, n_t, v_names_health_states , d.c, d.e, Trt = "Shift in practice")
+
+
+# save(sim_shift_clinical_practice, file = "C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/sim_shift_clinical_practice_10000sims.RData")
+
+
+load("C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/sim_shift_clinical_practice_100000sims.RData")
+
+# sim_current_clinical_practice <- Microsim_cp(v_m_on_waitlist, n_c, n_t, v_names_health_states, d.c, d.e, Trt = "Current practice")
+
+# save(sim_current_clinical_practice, file = "C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/sim_current_clinical_practice_10000sims.RData")
+
+#
+load("C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/sim_current_clinical_practice_100000sims.Rdata")
+comp.time = Sys.time() - p
+
+comp.time
+```
+
+# Cost-effectiveness analysis
+```{r}
+# store the mean costs (and the MCSE) of each strategy in a new variable v.C (vector costs) 
+v.C <- c(sim_shift_clinical_practice$tc_hat, sim_current_clinical_practice$tc_hat) 
+se.C <- c(sd(sim_shift_clinical_practice$tc), sd(sim_current_clinical_practice$tc)) / sqrt(n_c) 
+# store the mean QALYs (and the MCSE) of each strategy in a new variable v.E (vector health outcomes) 
+v.E <- c(sim_shift_clinical_practice$te_hat, sim_current_clinical_practice$te_hat)
+se.E <- c(sd(sim_shift_clinical_practice$te), sd(sim_current_clinical_practice$te)) / sqrt(n_c)
+
+delta.C <- v.C[1] - v.C[2] # calculate incremental costs 
+delta.E <- v.E[1] - v.E[2] # calculate incremental QALYs 
+se.delta.E <- sd(sim_shift_clinical_practice$te - sim_current_clinical_practice$te) / sqrt(n_c) # Monte Carlo squared error (MCSE) of incremental QALYs 
+se.delta.C <- sd(sim_shift_clinical_practice$tc - sim_current_clinical_practice$tc) / sqrt(n_c) # Monte Carlo squared error (MCSE) of incremental Costs 
+ICER <- delta.C / delta.E # calculate the ICER 
+results <- c(delta.C, delta.E, ICER) # store the values in a new variable
+
+table_micro <- data.frame( c(round(v.C, 0), ""), # costs per arm 
+                           c(round(se.C, 0), ""), # MCSE for costs 
+                           c(round(v.E, 3), ""), # health outcomes per arm 
+                           c(round(se.E, 3), ""), # MCSE for health outcomes 
+                           c("", round(delta.C, 0), ""), # incremental costs 
+                           c("", round(se.delta.C, 0),""), # MCSE for incremental costs 
+                           c("", round(delta.E, 3), ""), # incremental QALYs 
+                           c("", round(se.delta.E, 3),""), # MCSE for health outcomes (QALYs) gained 
+                           c("", round(ICER, 0), "") # ICER 
+) 
+rownames(table_micro) <- c(Trt, "* are MCSE values") # name the rows 
+colnames(table_micro) <- c("Costs", "*", "QALYs", "*", "Incremental Costs", "*", "QALYs Gained", "*", "ICER") # name the columns 
+# table(table_micro)
+
+```
+
+# Create graphs for incremental costs, incremental QALYs, ICER
+```{r}
+# Incremental Costs
+costs_shift <- sim_shift_clinical_practice[["tc"]]
+costs_current <- sim_current_clinical_practice[["tc"]]
+
+# Calculate differences in costs
+cost_differences <- costs_shift - costs_current
+
+# Incremental QALYs
+qalys_shift <- sim_shift_clinical_practice[["te"]]
+qalys_current <- sim_current_clinical_practice[["te"]]
+
+# Calculate differences in costs
+qaly_differences <- qalys_shift - qalys_current
+
+
+# Convert the matrix to a data frame for easier plotting
+df_differences <- data.frame(Individual = rownames(cost_differences), Cost_Difference = as.vector(cost_differences),
+                             QALY_Difference = as.vector(qaly_differences))
+
+# Calculate ICER but replace Inf and NaN with NA
+df_differences$ICER <- with(df_differences, ifelse(QALY_Difference == 0, NA, Cost_Difference / QALY_Difference))
+df_differences$ICER <- ifelse(is.infinite(df_differences$ICER), NA, df_differences$ICER)  # Replace Inf with NA
+df_differences$ICER <- ifelse(is.nan(df_differences$ICER), NA, df_differences$ICER)       # Replace NaN with NA
+df_differences$ICER[is.na(df_differences$ICER)] <- 0
+
+# Calculating cumulative means
+df_differences$CumulativeMean_cost <- cumsum(df_differences$Cost_Difference) / seq_along(df_differences$Cost_Difference)
+df_differences$CumulativeMean_qaly <- cumsum(df_differences$QALY_Difference) / seq_along(df_differences$QALY_Difference)
+
+# Calculate cumulative sum of ICER
+df_differences$CumulativeSum_icer <- cumsum(df_differences$ICER)
+
+# Calculate the running count of non-NA ICER values
+df_differences$RunningCount_icer <- cumsum(!is.na(df_differences$ICER))
+
+# Now calculate the cumulative mean of ICER only for non-zero counts
+df_differences$CumulativeMean_icer <- ifelse(df_differences$RunningCount_icer > 0, 
+                                              df_differences$CumulativeSum_icer / df_differences$RunningCount_icer, 0)
+
+
+# Plot cumulative mean cost differences
+ggplot(df_differences, aes(x = seq_along(CumulativeMean_cost), y = CumulativeMean_cost)) +
+  geom_line() + 
+  geom_hline(yintercept = mean(df_differences$Cost_Difference), linetype = "dashed") +
+  labs(x = "Number of individuals", y = "Incremental costs ($)") +
+  theme_minimal()
+
+# Plot cumulative mean qalys differences
+ggplot(df_differences, aes(x = seq_along(CumulativeMean_qaly), y = CumulativeMean_qaly)) +
+  geom_line() + 
+  geom_hline(yintercept = mean(df_differences$QALY_Difference), linetype = "dashed") +
+  labs(x = "Number of individuals", y = "Incremental QALYs") +
+  theme_minimal()
+
+# Plot cumulative mean ICERs
+ggplot(subset(df_differences, RunningCount_icer > 0), 
+       aes(x = seq_along(CumulativeMean_icer), y = CumulativeMean_icer)) +
+  geom_line() + 
+   geom_hline(yintercept = mean(df_differences$ICER), linetype = "dashed") +
+  labs(x = "Number of individuals", y = "ICER ($/QALY)") +
+  theme_minimal()
+
+```
+
+
+# Create data frames for traces
+```{r}
+# Get list of traces
+traces_current <- sim_current_clinical_practice[["TR"]]
+
+# Convert the matrix to a data frame
+traces_df_current <- as.data.frame(traces_current)
+
+# Create a new "Cycle" column from the row names
+traces_df_current$Cycle <- row.names(traces_current)
+traces_df_current$Cycle <- 0:80
+
+traces_df_current <- traces_df_current %>%
+  rowwise() %>%  
+  mutate(Good_graft = sum(c_across(
+    c(`Good graft DBD SCD`, `Good graft DBD ECD`, `Good graft DCD`)
+  ), na.rm = TRUE)) %>%
+  ungroup()  
+
+traces_df_current <- traces_df_current %>%
+  rowwise() %>% 
+  mutate(Moderate_graft = sum(c_across(
+    c(
+      `Moderate graft DBD SCD`,
+      `Moderate graft DBD ECD`,
+      `Moderate graft DCD`
+    )
+  ), na.rm = TRUE)) %>%
+  ungroup()  
+
+traces_df_current <- traces_df_current %>%
+  rowwise() %>%  
+  mutate(Poor_graft = sum(c_across(
+    c(`Poor graft DBD SCD`, `Poor graft DBD ECD`, `Poor graft DCD`)
+  ), na.rm = TRUE)) %>%
+  ungroup()  
+
+traces_df_current <- traces_df_current %>%
+  rowwise() %>%  
+  mutate(Liver_trans_1yr = sum(c_across(
+    c(
+      `Liver transplant 3`,
+      `Liver transplant 6`,
+      `Liver transplant 9`,
+      `Liver transplant 12`
+    )
+  ), na.rm = TRUE)) %>%
+  ungroup()  
+
+write_xlsx(traces_df_current, path =  "C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Microsim model/Traces_current_clinical_practice.xlsx")
+
+# Get list of traces
+traces_shift <- sim_shift_clinical_practice[["TR"]]
+
+# Convert the matrix to a data frame
+traces_df_shift <- as.data.frame(traces_shift)
+
+# Create a new "Cycle" column from the row names
+traces_df_shift$Cycle <- row.names(traces_shift)
+traces_df_shift$Cycle <- 0:80
+
+traces_df_shift <- traces_df_shift %>%
+  rowwise() %>%  
+  mutate(Good_graft = sum(c_across(
+    c(`Good graft DBD SCD`, `Good graft DBD ECD`, `Good graft DCD`)
+  ), na.rm = TRUE)) %>%
+  ungroup()  
+
+traces_df_shift <- traces_df_shift %>%
+  rowwise() %>% 
+  mutate(Moderate_graft = sum(c_across(
+    c(
+      `Moderate graft DBD SCD`,
+      `Moderate graft DBD ECD`,
+      `Moderate graft DCD`
+    )
+  ), na.rm = TRUE)) %>%
+  ungroup()  
+
+traces_df_shift <- traces_df_shift %>%
+  rowwise() %>%  
+  mutate(Poor_graft = sum(c_across(
+    c(`Poor graft DBD SCD`, `Poor graft DBD ECD`, `Poor graft DCD`)
+  ), na.rm = TRUE)) %>%
+  ungroup()  
+
+traces_df_shift <- traces_df_shift %>%
+  rowwise() %>%  
+  mutate(Liver_trans_1yr = sum(c_across(
+    c(
+      `Liver transplant 3`,
+      `Liver transplant 6`,
+      `Liver transplant 9`,
+      `Liver transplant 12`
+    )
+  ), na.rm = TRUE)) %>%
+  ungroup()  
+
+
+write_xlsx(traces_df_shift, path =  "C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Microsim model/Traces_shift_clinical_practice.xlsx")
+
+```
+
+
+# Compare traces with the markov model
+```{r}
+current_practice_markov <- read.csv("C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Markov model/R/Traces/R - current practice.csv") %>% 
+  dplyr::select(-X)
+
+
+proposed_practice_markov <-
+ read.csv("C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Markov model/R/Traces/R - proposed practice.csv")%>% 
+  dplyr::select(-X)
+
+melt_cp_markov <- current_practice_markov
+
+melt_pp_markov <- proposed_practice_markov
+
+
+# melt_cp_markov <- melt(current_practice_markov, id.vars = "Stage")
+
+# melt_pp_markov <- melt(proposed_practice_markov, id.vars = "Stage")
+
+
+melt_cp_micro <- melt(traces_df_current,
+                      id.vars = "Cycle") %>% 
+  rename(Stage = Cycle)
+
+melt_pp_micro <- melt(traces_df_shift,
+                      id.vars = "Cycle") %>% 
+  rename(Stage = Cycle)
+```
+
+## On waitlist
+```{r}
+On_waitlist_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Waitlist")
+
+On_waitlist_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "On waitlist")
+
+On_waitlist_pp_markov$value <- as.numeric(On_waitlist_pp_markov$value)
+
+On_waitlist_pp_micro$value <- as.numeric(On_waitlist_pp_micro$value)
+
+on_wait_pp<- ggplot() +
+  geom_line(data = On_waitlist_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = On_waitlist_pp_micro,
+            aes(x = Stage, y = value, colour = "Proposed Practice (Micro)")) +
+  labs(title = "On waitlist proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+ On_waitlist_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Waitlist")
+
+On_waitlist_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "On waitlist")
+
+On_waitlist_cp_markov$value <- as.numeric(On_waitlist_cp_markov$value)
+
+On_waitlist_cp_micro$value <- as.numeric(On_waitlist_cp_micro$value)
+
+on_wait_cp <- ggplot() +
+  geom_line(data = On_waitlist_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = On_waitlist_cp_micro,
+            aes(x = Stage, y = value, colour = "Current Practice (Micro)")) +
+  labs(title = "On waitlist current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(on_wait_cp, on_wait_pp)
+
+```
+
+## DBD SCD
+
+```{r}
+#good
+DBDSCD_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "DBD_SCD_good")
+
+DBDSCD_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "DBD SCD good")
+
+DBDSCD_pp_markov$value <- as.numeric(DBDSCD_pp_markov$value)
+
+DBDSCD_pp_micro$value <- as.numeric(DBDSCD_pp_micro$value)
+
+DBDSCD_pp <- ggplot() +
+  geom_line(data = DBDSCD_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DBDSCD_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DBD SCD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+DBDSCD_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "DBD_SCD_good")
+
+DBDSCD_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "DBD SCD good")
+
+DBDSCD_cp_markov$value <- as.numeric(DBDSCD_cp_markov$value)
+
+DBDSCD_cp_micro$value <- as.numeric(DBDSCD_cp_micro$value)
+
+DBDSCD_cp <- ggplot() +
+  geom_line(data = DBDSCD_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DBDSCD_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DBD SCD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(DBDSCD_pp, DBDSCD_cp)
+
+# moderate
+DBDSCD_pp_moderate_markov <- melt_pp_markov %>% 
+  filter(variable == "DBD_SCD_moderate")
+
+DBDSCD_pp_moderate_micro <- melt_pp_micro %>% 
+  filter(variable == "DBD SCD moderate")
+
+DBDSCD_pp_moderate_markov$value <- as.numeric(DBDSCD_pp_moderate_markov$value)
+
+DBDSCD_pp_moderate_micro$value <- as.numeric(DBDSCD_pp_moderate_micro$value)
+
+DBDSCD_pp_moderate <- ggplot() +
+  geom_line(data = DBDSCD_pp_moderate_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DBDSCD_pp_moderate_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DBD SCD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+# 
+DBDSCD_cp_moderate_markov <- melt_cp_markov %>% 
+  filter(variable == "DBD_SCD_moderate")
+
+DBDSCD_cp_tree_micro <- melt_cp_micro %>% 
+  filter(variable == "DBD SCD moderate")
+
+DBDSCD_cp_moderate_markov$value <- as.numeric(DBDSCD_cp_moderate_markov$value)
+
+DBDSCD_cp_tree_micro$value <- as.numeric(DBDSCD_cp_tree_micro$value)
+
+DBDSCD_cp_moderate <- ggplot() +
+  geom_line(data = DBDSCD_cp_moderate_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DBDSCD_cp_tree_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DBD SCD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(DBDSCD_pp_moderate, DBDSCD_cp_moderate)
+
+
+# poor
+DBDSCD_pp_poor_markov <- melt_pp_markov %>% 
+  filter(variable == "DBD_SCD_poor")
+
+DBDSCD_pp_poor_micro <- melt_pp_micro %>% 
+  filter(variable == "DBD SCD poor")
+
+DBDSCD_pp_poor_markov$value <- as.numeric(DBDSCD_pp_poor_markov$value)
+
+DBDSCD_pp_poor_micro$value <- as.numeric(DBDSCD_pp_poor_micro$value)
+
+DBDSCD_pp_poor <- ggplot() +
+  geom_line(data = DBDSCD_pp_poor_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DBDSCD_pp_poor_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DBD SCD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+DBDSCD_cp_poor_markov <- melt_cp_markov %>% 
+  filter(variable == "DBD_SCD_poor")
+
+DBDSCD_cp_poor_micro <- melt_cp_micro %>% 
+  filter(variable == "DBD SCD poor")
+
+DBDSCD_cp_poor_markov$value <- as.numeric(DBDSCD_cp_poor_markov$value)
+
+DBDSCD_cp_poor_micro$value <- as.numeric(DBDSCD_cp_poor_micro$value)
+
+DBDSCD_cp_poor <- ggplot() +
+  geom_line(data = DBDSCD_cp_poor_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DBDSCD_cp_poor_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DBD SCD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(DBDSCD_pp_poor, DBDSCD_cp_poor)
+
+```
+
+## DBD ECD
+
+```{r}
+#good
+DBDECD_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "DBD_ECD_good")
+
+DBDECD_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "DBD ECD good")
+
+DBDECD_pp_markov$value <- as.numeric(DBDECD_pp_markov$value)
+
+DBDECD_pp_micro$value <- as.numeric(DBDECD_pp_micro$value)
+
+DBDECD_pp <- ggplot() +
+  geom_line(data = DBDECD_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DBDECD_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DBD ECD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+DBDECD_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "DBD_ECD_good")
+
+DBDECD_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "DBD ECD good")
+
+DBDECD_cp_markov$value <- as.numeric(DBDECD_cp_markov$value)
+
+DBDECD_cp_micro$value <- as.numeric(DBDECD_cp_micro$value)
+
+DBDECD_cp <- ggplot() +
+  geom_line(data = DBDECD_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DBDECD_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DBD ECD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+plot_grid(DBDECD_pp, DBDECD_cp)
+
+# moderate
+DBDECD_pp_moderate_markov <- melt_pp_markov %>% 
+  filter(variable == "DBD_ECD_moderate")
+
+DBDECD_pp_moderate_micro <- melt_pp_micro %>% 
+  filter(variable == "DBD ECD moderate")
+
+DBDECD_pp_moderate_markov$value <- as.numeric(DBDECD_pp_moderate_markov$value)
+
+DBDECD_pp_moderate_micro$value <- as.numeric(DBDECD_pp_moderate_micro$value)
+
+DBDECD_pp_moderate <- ggplot() +
+  geom_line(data = DBDECD_pp_moderate_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DBDECD_pp_moderate_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DBD ECD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+DBDECD_cp_moderate_markov <- melt_cp_markov %>% 
+  filter(variable == "DBD_ECD_moderate")
+
+DBDECD_cp_tree_micro <- melt_cp_micro %>% 
+  filter(variable == "DBD ECD moderate")
+
+DBDECD_cp_moderate_markov$value <- as.numeric(DBDECD_cp_moderate_markov$value)
+
+DBDECD_cp_tree_micro$value <- as.numeric(DBDECD_cp_tree_micro$value)
+
+DBDECD_cp_moderate <- ggplot() +
+  geom_line(data = DBDECD_cp_moderate_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DBDECD_cp_tree_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DBD ECD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+plot_grid(DBDECD_pp_moderate, DBDECD_cp_moderate)
+
+
+# poor
+DBDECD_pp_poor_markov <- melt_pp_markov %>% 
+  filter(variable == "DBD_ECD_poor")
+
+DBDECD_pp_poor_micro <- melt_pp_micro %>% 
+  filter(variable == "DBD ECD poor")
+
+DBDECD_pp_poor_markov$value <- as.numeric(DBDECD_pp_poor_markov$value)
+
+DBDECD_pp_poor_micro$value <- as.numeric(DBDECD_pp_poor_micro$value)
+
+DBDECD_pp_poor <- ggplot() +
+  geom_line(data = DBDECD_pp_poor_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DBDECD_pp_poor_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DBD ECD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+DBDECD_cp_poor_markov <- melt_cp_markov %>% 
+  filter(variable == "DBD_ECD_poor")
+
+DBDECD_cp_poor_micro <- melt_cp_micro %>% 
+  filter(variable == "DBD ECD poor")
+
+DBDECD_cp_poor_markov$value <- as.numeric(DBDECD_cp_poor_markov$value)
+
+DBDECD_cp_poor_micro$value <- as.numeric(DBDECD_cp_poor_micro$value)
+
+DBDECD_cp_poor <- ggplot() +
+  geom_line(data = DBDECD_cp_poor_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DBDECD_cp_poor_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DBD ECD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+plot_grid(DBDECD_pp_poor, DBDECD_cp_poor)
+
+```
+
+## DCD
+```{r}
+#good
+DCD_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "DCD_good")
+
+DCD_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "DCD good")
+
+DCD_pp_markov$value <- as.numeric(DCD_pp_markov$value)
+
+DCD_pp_micro$value <- as.numeric(DCD_pp_micro$value)
+
+DCD_pp <- ggplot() +
+  geom_line(data = DCD_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DCD_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DCD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+DCD_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "DCD_good")
+
+DCD_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "DCD good")
+
+DCD_cp_markov$value <- as.numeric(DCD_cp_markov$value)
+
+DCD_cp_micro$value <- as.numeric(DCD_cp_micro$value)
+
+DCD_cp <- ggplot() +
+  geom_line(data = DCD_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DCD_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DCD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+plot_grid(DCD_pp, DCD_cp)
+
+# moderate
+DCD_pp_moderate_markov <- melt_pp_markov %>% 
+  filter(variable == "DCD_moderate")
+
+DCD_pp_moderate_micro <- melt_pp_micro %>% 
+  filter(variable == "DCD moderate")
+
+DCD_pp_moderate_markov$value <- as.numeric(DCD_pp_moderate_markov$value)
+
+DCD_pp_moderate_micro$value <- as.numeric(DCD_pp_moderate_micro$value)
+
+DCD_pp_moderate <- ggplot() +
+  geom_line(data = DCD_pp_moderate_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DCD_pp_moderate_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DCD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+DCD_cp_moderate_markov <- melt_cp_markov %>% 
+  filter(variable == "DCD_moderate")
+
+DCD_cp_tree_micro <- melt_cp_micro %>% 
+  filter(variable == "DCD moderate")
+
+DCD_cp_moderate_markov$value <- as.numeric(DCD_cp_moderate_markov$value)
+
+DCD_cp_tree_micro$value <- as.numeric(DCD_cp_tree_micro$value)
+
+DCD_cp_moderate <- ggplot() +
+  geom_line(data = DCD_cp_moderate_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DCD_cp_tree_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DCD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+plot_grid(DCD_pp_moderate, DCD_cp_moderate)
+
+
+# poor
+DCD_pp_poor_markov <- melt_pp_markov %>% 
+  filter(variable == "DCD_poor")
+
+DCD_pp_poor_micro <- melt_pp_micro %>% 
+  filter(variable == "DCD poor")
+
+DCD_pp_poor_markov$value <- as.numeric(DCD_pp_poor_markov$value)
+
+DCD_pp_poor_micro$value <- as.numeric(DCD_pp_poor_micro$value)
+
+DCD_pp_poor <- ggplot() +
+  geom_line(data = DCD_pp_poor_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = DCD_pp_poor_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "DCD proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+DCD_cp_poor_markov <- melt_cp_markov %>% 
+  filter(variable == "DCD_poor")
+
+DCD_cp_poor_micro <- melt_cp_micro %>% 
+  filter(variable == "DCD poor")
+
+DCD_cp_poor_markov$value <- as.numeric(DCD_cp_poor_markov$value)
+
+DCD_cp_poor_micro$value <- as.numeric(DCD_cp_poor_micro$value)
+
+DCD_cp_poor <- ggplot() +
+  geom_line(data = DCD_cp_poor_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = DCD_cp_poor_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "DCD current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(DCD_pp_poor, DCD_cp_poor)
+
+```
+
+## Good graft function
+```{r echo=FALSE}
+ggf_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Good_graft")
+
+ggf_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Good_graft")
+
+ggf_pp_markov$value <- as.numeric(ggf_pp_markov$value)
+
+ggf_pp_micro$value <- as.numeric(ggf_pp_micro$value)
+
+good_graft_pp <- ggplot() +
+  geom_line(data = ggf_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = ggf_pp_micro,
+            aes(x = Stage, y = value, colour = "Proposed Practice (Micro)")) +
+  labs(title = "Good graft proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+ggf_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Good_graft")
+
+ggf_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Good_graft")
+
+ggf_cp_markov$value <- as.numeric(ggf_cp_markov$value)
+
+ggf_cp_micro$value <- as.numeric(ggf_cp_micro$value)
+
+good_graft_cp <- ggplot() +
+  geom_line(data = ggf_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = ggf_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Good graft current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(good_graft_pp, good_graft_cp)
+
+```
+
+## Moderate graft function
+```{r echo=FALSE}
+mgf_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Moderate_graft")
+
+mgf_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Moderate_graft")
+
+mgf_pp_markov$value <- as.numeric(mgf_pp_markov$value)
+mgf_pp_micro$value <- as.numeric(mgf_pp_micro$value)
+
+moderate_pp <- ggplot() +
+  geom_line(data = mgf_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = mgf_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Moderate graft proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+mgf_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Moderate_graft")
+
+mgf_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Moderate_graft")
+
+mgf_cp_markov$value <- as.numeric(mgf_cp_markov$value)
+mgf_cp_micro$value <- as.numeric(mgf_cp_micro$value)
+
+moderate_cp <- ggplot() +
+  geom_line(data = mgf_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = mgf_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Moderate graft current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(moderate_pp, moderate_cp)
+
+```
+
+## Poor graft function
+```{r echo=FALSE}
+pgf_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Poor_graft")
+
+pgf_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Poor_graft")
+
+pgf_pp_markov$value <- as.numeric(pgf_pp_markov$value)
+pgf_pp_micro$value <- as.numeric(pgf_pp_micro$value)
+
+poor_pp <- ggplot() +
+  geom_line(data = pgf_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = pgf_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Poor graft proposed practice") +
+  scale_y_continuous("% of patients") +
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend",
+                      values = c("Proposed Practice (Markov)" = "Green",
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+pgf_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Poor_graft")
+
+pgf_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Poor_graft")
+
+pgf_cp_markov$value <- as.numeric(pgf_cp_markov$value)
+pgf_cp_micro$value <- as.numeric(pgf_cp_micro$value)
+
+poor_cp <- ggplot() +
+  geom_line(data = pgf_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = pgf_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Poor graft current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(poor_pp, poor_cp)
+```
+
+## Off waitlist
+```{r}
+off_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Off_waitlist")
+
+off_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Off waitlist")
+
+off_pp_markov$value <- as.numeric(off_pp_markov$value)
+
+off_pp_micro$value <- as.numeric(off_pp_micro$value)
+
+off_pp <- ggplot() +
+  geom_line(data = off_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = off_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Off waitlist prpopsed practice") +
+  scale_y_continuous("% of patients")+
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+
+# 
+off_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Off_waitlist")
+
+off_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Off waitlist")
+
+off_cp_markov$value <- as.numeric(off_cp_markov$value)
+
+off_cp_micro$value <- as.numeric(off_cp_micro$value)
+
+off_cp <- ggplot() +
+  geom_line(data = off_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = off_cp_micro,
+            aes(x = Stage, y = value, color =  "Current Practice (Micro)")) +
+  labs(title = "Off waitlist current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(off_pp, off_cp)
+```
+
+## HIV
+```{r}
+HIV_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HIV")
+
+HIV_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "HIV")
+
+HIV_pp_markov$value <- as.numeric(HIV_pp_markov$value)
+
+HIV_pp_micro$value <- as.numeric(HIV_pp_micro$value)
+
+HIV_pp <- ggplot() +
+  geom_line(data = HIV_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = HIV_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HIV proposed practice") +
+  scale_y_continuous("% of patients")+
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+
+# 
+HIV_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HIV")
+
+HIV_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "HIV")
+
+HIV_cp_markov$value <- as.numeric(HIV_cp_markov$value)
+
+HIV_cp_micro$value <- as.numeric(HIV_cp_micro$value)
+
+HIV_cp <- ggplot() +
+  geom_line(data = HIV_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = HIV_cp_micro,
+            aes(x = Stage, y = value, color =  "Current Practice (Micro)")) +
+  labs(title = "HIV current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(HIV_pp, HIV_cp)
+```
+
+## HBV
+```{r echo=FALSE}
+HBV_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HBV")
+
+HBV_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "HBV")
+
+HBV_pp_markov$value <- as.numeric(HBV_pp_markov$value)
+
+HBV_pp_micro$value <- as.numeric(HBV_pp_micro$value)
+
+HBV_pp <- ggplot() +
+  geom_line(data = HBV_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = HBV_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HBV proposed practice") +
+  scale_y_continuous("% of patients")+
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+
+# 
+HBV_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HBV")
+
+HBV_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "HBV")
+
+HBV_cp_markov$value <- as.numeric(HBV_cp_markov$value)
+
+HBV_cp_micro$value <- as.numeric(HBV_cp_micro$value)
+
+HBV_cp <- ggplot() +
+  geom_line(data = HBV_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = HBV_cp_micro,
+            aes(x = Stage, y = value, color =  "Current Practice (Micro)")) +
+  labs(title = "HBV current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(HBV_pp, HBV_cp)
+```
+
+## HCV
+```{r echo=FALSE}
+HCV_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HCV")
+
+HCV_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "HCV")
+
+HCV_pp_markov$value <- as.numeric(HCV_pp_markov$value)
+
+HCV_pp_micro$value <- as.numeric(HCV_pp_micro$value)
+
+HCV_pp <- ggplot() +
+  geom_line(data = HCV_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = HCV_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HCV proposed practice") +
+  scale_y_continuous("% of patients")+
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+HCV_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HCV")
+
+HCV_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "HCV")
+
+HCV_cp_markov$value <- as.numeric(HCV_cp_markov$value)
+
+HCV_cp_micro$value <- as.numeric(HCV_cp_micro$value)
+
+HCV_cp <- ggplot() +
+  geom_line(data = HCV_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = HCV_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "HCV current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(HCV_pp, HCV_cp)
+```
+
+## HBV Compensated cirrhosis
+```{r}
+#
+HBV_compcir_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HepB_Comp_cirr")
+
+HBV_compcir_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Hep B Comp cirr")
+
+HBV_compcir_pp_markov$value <- as.numeric(HBV_compcir_pp_markov$value)
+
+HBV_compcir_pp_micro$value <- as.numeric(HBV_compcir_pp_micro$value)
+
+HBV_compcir_pp <- ggplot() +
+  geom_line(data = HBV_compcir_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = HBV_compcir_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HBV comp cirr proposed practice") +
+  scale_y_continuous("% of patients")+
+  theme(legend.position = "none") +
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+HBV_compcir_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HepB_Comp_cirr")
+
+HBV_compcir_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Hep B Comp cirr")
+
+HBV_compcir_cp_markov$value <- as.numeric(HBV_compcir_cp_markov$value)
+
+HBV_compcir_cp_micro$value <- as.numeric(HBV_compcir_cp_micro$value)
+
+HBV_compcir_cp <- ggplot() +
+  geom_line(data = HBV_compcir_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = HBV_compcir_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "HBV comp cirr current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(HBV_compcir_pp, HBV_compcir_cp)
+
+```
+
+## HCV Compensated cirrhosis
+```{r}
+#
+HCV_compcir_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HepC_Comp_cirr")
+
+HCV_compcir_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Hep C Comp cirr")
+
+HCV_compcir_pp_markov$value <- as.numeric(HCV_compcir_pp_markov$value)
+
+HCV_compcir_pp_micro$value <- as.numeric(HCV_compcir_pp_micro$value)
+
+HCV_compcir_pp <- ggplot() +
+  geom_line(data = HCV_compcir_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = HCV_compcir_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HCV comp cirr proposed practice") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+HCV_compcir_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HepC_Comp_cirr")
+
+HCV_compcir_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Hep C Comp cirr")
+
+HCV_compcir_cp_markov$value <- as.numeric(HCV_compcir_cp_markov$value)
+
+HCV_compcir_cp_micro$value <- as.numeric(HCV_compcir_cp_micro$value)
+
+HCV_compcir_cp <- ggplot() +
+  geom_line(data = HCV_compcir_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = HCV_compcir_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "HCV comp cirr current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(HCV_compcir_pp, HCV_compcir_cp)
+
+```
+
+## HBV Decompensated cirrhosis
+```{r}
+#
+HBV_decompcir_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HepB_Decomp_cirr")
+
+HBV_decompcir_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Hep B Decomp cirr")
+
+HBV_decompcir_pp_markov$value <- as.numeric(HBV_decompcir_pp_markov$value)
+
+HBV_decompcir_pp_micro$value <- as.numeric(HBV_decompcir_pp_micro$value)
+
+HBV_decompcir_pp <- ggplot() +
+  geom_line(data = HBV_decompcir_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = HBV_decompcir_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HBV decomp cirr proposed practice") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+HBV_decompcir_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HepB_Comp_cirr")
+
+HBV_decompcir_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Hep B Decomp cirr")
+
+HBV_decompcir_cp_markov$value <- as.numeric(HBV_decompcir_cp_markov$value)
+
+HBV_decompcir_cp_micro$value <- as.numeric(HBV_decompcir_cp_micro$value)
+
+HBV_decompcir_cp <- ggplot() +
+  geom_line(data = HBV_decompcir_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = HBV_decompcir_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "HBV decomp cirr current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(HBV_decompcir_pp, HBV_compcir_cp)
+```
+
+## HCV Decompensated cirrhosis
+```{r}
+#
+HCV_decompcir_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HepC_Decomp_cirr")
+
+HCV_decompcir_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Hep C Decomp cirr")
+
+HCV_decompcir_pp_markov$value <- as.numeric(HCV_decompcir_pp_markov$value)
+
+HCV_decompcir_pp_micro$value <- as.numeric(HCV_decompcir_pp_micro$value)
+
+HCV_decompcir_pp <- ggplot() +
+  geom_line(data = HCV_decompcir_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = HCV_decompcir_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HCV decomp cirr proposed practice") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+HCV_decompcir_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HepC_Decomp_cirr")
+
+HCV_decompcir_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Hep C Decomp cirr")
+
+HCV_decompcir_cp_markov$value <- as.numeric(HCV_decompcir_cp_markov$value)
+
+HCV_decompcir_cp_micro$value <- as.numeric(HCV_decompcir_cp_micro$value)
+
+HCV_decompcir_cp <- ggplot() +
+  geom_line(data = HCV_decompcir_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = HCV_decompcir_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "HCV decomp cirr current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(HCV_decompcir_pp, HCV_decompcir_cp)
+```
+
+## HBV Hepatocellular carcinoma
+```{r}
+#
+HBV_hcc_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HepB_HCC")
+
+HBV_hcc_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Hep B HCC")
+
+HBV_hcc_pp_markov$value <- as.numeric(HBV_hcc_pp_markov$value)
+
+HBV_hcc_pp_micro$value <- as.numeric(HBV_hcc_pp_micro$value)
+
+HBV_hcc_pp <- ggplot() +
+  geom_line(data = HBV_hcc_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = HBV_hcc_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HBV HCC proposed practice") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+HBV_hcc_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HepB_HCC")
+
+HBV_hcc_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Hep B HCC")
+
+HBV_hcc_cp_markov$value <- as.numeric(HBV_hcc_cp_markov$value)
+
+HBV_hcc_cp_micro$value <- as.numeric(HBV_hcc_cp_micro$value)
+
+HBV_hcc_cp <- ggplot() +
+  geom_line(data = HBV_hcc_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = HBV_hcc_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "HBV HCC current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(HBV_hcc_pp, HBV_hcc_cp)
+
+```
+
+## HCV Hepatocellular carcinoma
+```{r}
+#
+hcv_hcc_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "HepC_HCC")
+
+hcv_hcc_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Hep C HCC")
+
+hcv_hcc_pp_markov$value <- as.numeric(hcv_hcc_pp_markov$value)
+
+hcv_hcc_pp_micro$value <- as.numeric(hcv_hcc_pp_micro$value)
+
+hcv_hcc_pp <- ggplot() +
+  geom_line(data = hcv_hcc_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = hcv_hcc_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "HCV HCC proposed practice") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+hcv_hcc_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "HepC_HCC")
+
+hcv_hcc_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Hep C HCC")
+
+hcv_hcc_cp_markov$value <- as.numeric(hcv_hcc_cp_markov$value)
+
+hcv_hcc_cp_micro$value <- as.numeric(hcv_hcc_cp_micro$value)
+
+hcv_hcc_cp <- ggplot() +
+  geom_line(data = hcv_hcc_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = hcv_hcc_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "HCV HCC current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(hcv_hcc_pp, hcv_hcc_cp)
+```
+
+## Spon clearance
+```{r}
+#
+spon_clear_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Spon_clear")
+
+spon_clear_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Spon clearance")
+
+spon_clear_pp_markov$value <- as.numeric(spon_clear_pp_markov$value)
+
+spon_clear_pp_micro$value <- as.numeric(spon_clear_pp_micro$value)
+
+spon_clear_pp <- ggplot() +
+  geom_line(data = spon_clear_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = spon_clear_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Spon clear proposed practice") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+spon_clear_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Spon_clear")
+
+spon_clear_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Spon clearance")
+
+spon_clear_cp_markov$value <- as.numeric(spon_clear_cp_markov$value)
+
+spon_clear_cp_micro$value <- as.numeric(spon_clear_cp_micro$value)
+
+spon_clear_cp <- ggplot() +
+  geom_line(data = spon_clear_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = spon_clear_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Spon clear current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(spon_clear_pp, spon_clear_cp)
+```
+
+## SVR
+```{r}
+#
+svr_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "SVR")
+
+svr_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "SVR")
+
+svr_pp_markov$value <- as.numeric(svr_pp_markov$value)
+
+svr_pp_micro$value <- as.numeric(svr_pp_micro$value)
+
+svr_pp <- ggplot() +
+  geom_line(data = svr_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = svr_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "SVR proposed practice") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+svr_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "SVR")
+
+svr_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "SVR")
+
+svr_cp_markov$value <- as.numeric(svr_cp_markov$value)
+
+svr_cp_micro$value <- as.numeric(svr_cp_micro$value)
+
+svr_cp <- ggplot() +
+  geom_line(data = svr_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = svr_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "SVR current practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(svr_pp, svr_cp)
+```
+
+## Liver transplant year 1
+```{r}
+liver_tx_1_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Liver_trans_1yr")
+
+liver_tx_1_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Liver_trans_1yr")
+
+liver_tx_1_pp_markov$value <- as.numeric(liver_tx_1_pp_markov$value)
+
+liver_tx_1_pp_micro$value <- as.numeric(liver_tx_1_pp_micro$value)
+
+ltx_pp <- ggplot() +
+  geom_line(data = liver_tx_1_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = liver_tx_1_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Liver transplant year 1 proposed prac") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+liver_tx_1_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Liver_trans_1yr")
+
+liver_tx_1_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Liver_trans_1yr")
+
+liver_tx_1_cp_markov$value <- as.numeric(liver_tx_1_cp_markov$value)
+
+liver_tx_1_cp_micro$value <- as.numeric(liver_tx_1_cp_micro$value)
+
+ltx_cp <- ggplot() +
+  geom_line(data = liver_tx_1_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = liver_tx_1_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Liver transplant year 1 current prac") +
+  scale_y_continuous("% of patients")+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Current Practice (Markov)" = "Green", 
+                                 "Current Practice (Micro)" = "Red"))
+
+plot_grid(ltx_pp, ltx_cp)
+```
+
+## Liver transplant year 2
+```{r}
+liver_tx_2_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Liver_trans_2yr")
+
+liver_tx_2_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Liver transplant yr 2")
+
+liver_tx_2_pp_markov$value <- as.numeric(liver_tx_2_pp_markov$value)
+
+liver_tx_2_pp_micro$value <- as.numeric(liver_tx_2_pp_micro$value)
+
+ltx_pp_2 <- ggplot() +
+  geom_line(data = liver_tx_2_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = liver_tx_2_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Liver transplant year 2 proposed prac") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+liver_tx_2_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Liver_trans_2yr")
+
+liver_tx_2_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Liver transplant yr 2")
+
+liver_tx_2_cp_markov$value <- as.numeric(liver_tx_2_cp_markov$value)
+
+liver_tx_2_cp_micro$value <- as.numeric(liver_tx_2_cp_micro$value)
+
+ltx_cp_2 <- ggplot() +
+  geom_line(data = liver_tx_2_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = liver_tx_2_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Liver transplant year 2 current prac") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(ltx_pp_2, ltx_cp_2)
+```
+
+## Death on waitlist
+```{r}
+Death_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Death_waitlist")
+
+Death_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Death on waitlist")
+
+Death_pp_markov$value <- as.numeric(Death_pp_markov$value)
+
+Death_pp_micro$value <- as.numeric(Death_pp_micro$value)
+
+Death_on_pp <- ggplot() +
+  geom_line(data = Death_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = Death_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Death on waitlist proposed practice") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+Death_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Death_waitlist")
+
+Death_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Death on waitlist")
+
+Death_cp_markov$value <- as.numeric(Death_cp_markov$value)
+
+Death_cp_micro$value <- as.numeric(Death_cp_micro$value)
+
+Death_on_cp <- ggplot() +
+  geom_line(data = Death_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = Death_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Death on waitlist practice") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(Death_on_pp, Death_on_cp)
+```
+
+## Death w functioning graft
+```{r}
+Death_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Death_w_functioning_graft")
+
+Death_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Death w functioning graft")
+
+Death_pp_markov$value <- as.numeric(Death_pp_markov$value)
+
+Death_pp_micro$value <- as.numeric(Death_pp_micro$value)
+
+Death_func_pp <- ggplot() +
+  geom_line(data = Death_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = Death_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Death functioning graft proposed prac") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+Death_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Death_w_functioning_graft")
+
+Death_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Death w functioning graft")
+
+Death_cp_markov$value <- as.numeric(Death_cp_markov$value)
+
+Death_cp_micro$value <- as.numeric(Death_cp_micro$value)
+
+Death_func_cp <- ggplot() +
+  geom_line(data = Death_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = Death_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Death functioning graft current prac") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(Death_func_pp, Death_func_cp)
+```
+
+## Death off waitlist
+```{r}
+Death_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Death_off_waitlist")
+
+Death_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Death off waitlist")
+
+Death_pp_markov$value <- as.numeric(Death_pp_markov$value)
+
+Death_pp_micro$value <- as.numeric(Death_pp_micro$value)
+
+Death_off_pp <- ggplot() +
+  geom_line(data = Death_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = Death_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Death off waitlist proposed prac") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+Death_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Death_off_waitlist")
+
+Death_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Death off waitlist")
+
+Death_cp_markov$value <- as.numeric(Death_cp_markov$value)
+
+Death_cp_micro$value <- as.numeric(Death_cp_micro$value)
+
+Death_off_cp <- ggplot() +
+  geom_line(data = Death_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = Death_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Death off waitlist current prac") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(Death_off_pp, Death_off_cp)
+```
+
+## Death after graft failure
+```{r}
+Death_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Death_after_graft_failure")
+
+Death_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Death after graft failure")
+
+Death_pp_markov$value <- as.numeric(Death_pp_markov$value)
+
+Death_pp_micro$value <- as.numeric(Death_pp_micro$value)
+
+Death_graft_pp <- ggplot() +
+  geom_line(data = Death_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = Death_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Death after graft failure proposed prac") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+Death_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Death_after_graft_failure")
+
+Death_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Death after graft failure")
+
+Death_cp_markov$value <- as.numeric(Death_cp_markov$value)
+
+Death_cp_micro$value <- as.numeric(Death_cp_micro$value)
+
+Death_graft_cp <- ggplot() +
+  geom_line(data = Death_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = Death_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Death after graft failure current prac") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(Death_graft_pp, Death_graft_cp)
+```
+
+## Death after liver failure
+```{r}
+Death_pp_markov <- melt_pp_markov %>% 
+  filter(variable == "Death_liver")
+
+Death_pp_micro <- melt_pp_micro %>% 
+  filter(variable == "Death end stage liver")
+
+Death_pp_markov$value <- as.numeric(Death_pp_markov$value)
+
+Death_pp_micro$value <- as.numeric(Death_pp_micro$value)
+
+Death_liver_pp <- ggplot() +
+  geom_line(data = Death_pp_markov, 
+            aes(x = Stage, y = value, colour = "Proposed Practice (Markov)")) +
+  geom_line(data = Death_pp_micro,
+            aes(x = Stage, y = value, color = "Proposed Practice (Micro)")) +
+  labs(title = "Death after end stage liver failure proposed prac") +
+  scale_y_continuous("% of patients")+
+    theme(legend.position = "none") +
+
+  scale_colour_manual(name = "Legend", 
+                      values = c("Proposed Practice (Markov)" = "Green", 
+                                 "Proposed Practice (Micro)" = "Red"))
+
+# 
+Death_cp_markov <- melt_cp_markov %>% 
+  filter(variable == "Death_liver")
+
+Death_cp_micro <- melt_cp_micro %>% 
+  filter(variable == "Death end stage liver")
+
+Death_cp_markov$value <- as.numeric(Death_cp_markov$value)
+
+Death_cp_micro$value <- as.numeric(Death_cp_micro$value)
+
+Death_liver_cp <- ggplot() +
+  geom_line(data = Death_cp_markov, 
+            aes(x = Stage, y = value, colour = "Current Practice (Markov)")) +
+  geom_line(data = Death_cp_micro,
+            aes(x = Stage, y = value, color = "Current Practice (Micro)")) +
+  labs(title = "Death after end stage liver failure current prac") +
+  scale_y_continuous("% of patients") +
+  scale_colour_manual(name = "Legend",
+                       labels = c("Current Practice (Markov)" = "Markov (R)",
+                                 "Current Practice (Micro)" = "Microsimulation (R)"),
+                      values = c("Current Practice (Markov)" = "Green",
+                                 "Current Practice (Micro)" = "Red")) 
+
+plot_grid(Death_liver_pp, Death_liver_cp)
+```
+
+# Combine plots
+```{r}
+figuresloc_1000000 <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Figures/100000 sims/'
+
+# 1 on waitlist
+combined_plots_waitlist <- grid.arrange(on_wait_pp, on_wait_cp, off_pp, off_cp, Death_on_pp, Death_on_cp, Death_off_pp, Death_off_cp, ncol = 2, nrow = 4)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_waitlist.pdf"), plot = combined_plots_waitlist, width = 16, height = 12)
+
+# 2 DBD SCD
+combined_plots_dbdscd <- grid.arrange(DBDSCD_pp, DBDSCD_cp, DBDSCD_pp_moderate, DBDSCD_cp_moderate, DBDSCD_pp_poor, DBDSCD_cp_poor, ncol = 2, nrow = 3)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_dbdscd.pdf"), plot = combined_plots_dbdscd, width = 16, height = 12)
+
+# 3 DBD ECD
+combined_plots_dbdecd <- grid.arrange(DBDECD_pp, DBDECD_cp, DBDECD_pp_moderate, DBDECD_cp_moderate, DBDECD_pp_poor, DBDECD_cp_poor, ncol = 2, nrow = 3)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_dbdecd.pdf"), plot = combined_plots_dbdecd, width = 16, height = 12)
+
+# 4 DCD
+combined_plots_DCD <- grid.arrange(DCD_pp, DCD_cp, DCD_pp_moderate, DCD_cp_moderate, DCD_pp_poor, DCD_cp_poor, ncol = 2, nrow = 3)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_DCD.pdf"), plot = combined_plots_DCD, width = 16, height = 12)
+
+# 5 graft
+combined_plots_graft <- grid.arrange(good_graft_pp, good_graft_cp, moderate_pp, moderate_cp, poor_pp, poor_cp, ncol = 2, nrow = 3)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_graft.pdf"), plot = combined_plots_graft, width = 16, height = 12)
+
+# 6 BBV
+combined_plots_bbv <- grid.arrange(HIV_pp, HIV_cp, HBV_pp, HBV_cp, HCV_pp, HCV_cp, ncol = 2, nrow = 3)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_bbv.pdf"), plot = combined_plots_bbv, width = 16, height = 12)
+
+# 7 liver disease 
+combined_plots_cirr <- grid.arrange(HBV_compcir_pp, HBV_compcir_cp, HCV_compcir_pp, HCV_compcir_cp, HBV_decompcir_pp, HBV_decompcir_cp, HCV_decompcir_pp, HCV_decompcir_cp, HBV_hcc_pp, HBV_hcc_cp, hcv_hcc_pp, hcv_hcc_cp, ncol = 2, nrow = 6)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_cirr.pdf"), plot = combined_plots_cirr, width = 16, height = 12)
+
+# 8 spon clearance
+combined_plots_clearance <- grid.arrange(spon_clear_pp, spon_clear_cp, svr_pp, svr_cp, ltx_pp, ltx_cp, ltx_pp_2, ltx_cp_2, ncol = 2, nrow = 4)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_clearance.pdf"), plot = combined_plots_clearance, width = 16, height = 12)
+
+# 9 death
+combined_plots_death <- grid.arrange(Death_func_pp, Death_func_cp, Death_graft_pp, Death_graft_cp, Death_liver_pp, Death_liver_cp, ncol = 2, nrow = 3)
+
+ggsave(file = file.path(figuresloc_1000000, "mm_combined_plots_death.pdf"), plot = combined_plots_death, width = 16, height = 12)
+```
+

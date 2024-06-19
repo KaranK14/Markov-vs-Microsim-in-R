@@ -1,0 +1,2980 @@
+---
+title: "Microsim model"
+author: "Karan Ketan Shah"
+date: "2023-08-15"
+output: html_document
+
+Microsimulation model: Code adapted from Krijkamp et al 2018
+Intervention: Proposed practice - Shift in clinical practice
+Comparator: Current practice - conservative practice
+  
+---
+
+# Load packages
+```{r setup, include=FALSE}
+rm(list = ls())  # remove any variables in R's memory
+
+# Load libraries
+library(tidyverse)
+library(readxl)
+library(SciViews)
+library(dampack)
+library(dplyr)
+library(writexl)
+library(parallel)
+library(doParallel)
+library(reshape2)
+library(cowplot)
+
+```
+
+# Directories
+
+```{r}
+modelsloc <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Microsim model'
+inputsloc <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Inputs/'
+results_shift <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/PSA results microsim/Shift'
+results_current <- 'C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Model results/PSA results microsim/Current'
+```
+
+# Load input files
+
+```{r}
+# load the data and capture the names of the loaded variables
+costs_vars <- load(file.path(inputsloc, 'costs.RData'))
+utility_vars <- load(file.path(inputsloc, 'Utility.RData'))
+transition_probs_vars <- load(file.path(inputsloc, 'transition_probs.RData'))
+```
+
+# Model setting
+
+```{r}
+cycle_length <- 0.25 # cycle length is 3 months
+Trt <-  c("Shift in practice", "Conservative practice") # store the strategy names
+d.e <-  d.c <- 0.0125 # discount rate adjusted for 3 monthly cycle length
+n_t <- 80 # number of cycles
+n_c <- 1000 # number of people
+tp_SVR <- 1 - (1 - 0.965) ^ cycle_length # efficacy of DAA agents for patients with hepC
+per_effect_hcv <- 0.05/4 # increase in % of kidney transplantation in proposed policy. These patients will directly go to HCV health state
+per_effect_increased_risk_behaviours <- 0.02/4 # increase in % of kidney transplantation in proposed policy. These patients will directly go to SCD health states
+
+tp_HIV_current_practice <- 0 # no hiv transmissions in the current practice
+
+c_diagosis_proposed_policy <- 3348.9
+
+```
+
+# Probabilistic sensitivity analysis
+```{r}
+# Create new environments
+## Load model, CEA and PSA functions ----
+envUtilities <- new.env()
+rmarkdown::render("C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Inputs/Script/Utilites.Rmd", envir = envUtilities)
+
+envCosts <- new.env()
+rmarkdown::render("C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Inputs/Script/Costs.Rmd", envir = envCosts)
+
+envTransProbs <- new.env()
+rmarkdown::render("C:/Users/kshah/OneDrive - The University of Sydney (Staff)/Markov vs microsim/Model/Inputs/Script/Inputs for transition probabilities.Rmd", envir = envTransProbs)
+
+n_sim <- 1000
+
+# Generate PSA input dataset
+df_psa_input_probs <- envTransProbs$generate_psa_params_probs(n_sim = n_sim, seed = 922231, range_PSA = 0.2)
+df_psa_input_costs <- envCosts$generate_psa_params_costs(n_sim = n_sim, seed = 922231, range_PSA = 0.2)
+df_psa_input_utils <- envUtilities$generate_psa_params_qalys(n_sim = n_sim, seed = 922231, range_PSA = 0.2)
+
+df_psa_input_probs <- df_psa_input_probs %>%
+  mutate(n_death_waitlist = if_else(n_death_waitlist == 0, 0.001, n_death_waitlist))
+
+```
+
+# Names of the health states in the model
+
+```{r}
+v_names_health_states <-
+  c(
+    "On waitlist",
+    "DBD SCD good",
+    "DBD SCD moderate",
+    "DBD SCD poor",
+    "DBD ECD good",
+    "DBD ECD moderate",
+    "DBD ECD poor",
+    "DCD good",
+    "DCD moderate",
+    "DCD poor",
+    "Good graft DBD SCD",
+    "Good graft DBD ECD",
+    "Good graft DCD",
+    "Moderate graft DBD SCD",
+    "Moderate graft DBD ECD",
+    "Moderate graft DCD",
+    "Poor graft DBD SCD",
+    "Poor graft DBD ECD",
+    "Poor graft DCD",
+    "Off waitlist",
+    "HIV",
+    "HBV",
+    "HCV",
+    "Hep B Comp cirr",
+    "Hep B Decomp cirr",
+    "Hep B HCC",
+    "Spon clearance",
+    "Hep C Comp cirr",
+    "Hep C Decomp cirr",
+    "Hep C HCC",
+    "SVR",
+    "Liver transplant 3",
+    "Liver transplant 6",
+    "Liver transplant 9",
+    "Liver transplant 12",
+    "Liver transplant yr 2",
+    "Death on waitlist",
+    "Death off waitlist",
+    "Death after graft failure",
+    "Death w functioning graft",
+    "Death end stage liver")
+
+n_states <- length(v_names_health_states) # number of health states
+
+v_m_on_waitlist <-
+  rep("On waitlist", n_c) # all starting on waitlist 
+
+```
+
+# Microsim function for the proposed practice - shift in clinical practice
+
+```{r}
+Microsim_pp <-
+  function(v_m_on_waitlist,
+           n_c,
+           n_t,
+           v_names_health_states,
+           d.c,
+           d.e,
+           index,
+           df_psa_input_costs,
+           df_psa_input_utils,
+           df_psa_input_probs,
+           sim_idx, n_sim,
+           TR.out = TRUE,
+           TS.out = TRUE,
+           Trt = FALSE,
+           seed = 1) {
+   
+    v.dwc <- 1 / (1 + d.c) ^ (0:n_t)   # cost discount weight based on the discount rate d.c
+    v.dwe <- 1 / (1 + d.e) ^ (0:n_t)   # QALY discount weight based on the discount rate d.e
+    
+    # matrix capturing the state name/costs/health outcomes for all individuals at each time point
+    m.M <- m.C <- m.E <-  matrix(nrow = n_c,
+                                 ncol = n_t + 1,
+                                 dimnames = list(paste("ind", 1:n_c, sep = " "), paste("cycle", 0:n_t, sep = " ")))
+    
+    m.M[, 1] <- v_m_on_waitlist   # initial health state for all individuals
+    
+    
+   for (i in 1:n_c) {
+      set.seed(seed + i)  # set the seed for every individual for the random number generator
+      
+      previous_state <- NA  # Initializing previous state
+    
+     m.C[i, 1] <- Costs_pp(m.M[i, 1], previous_state, Trt, current_costs, current_probs, per_effect_increased_risk_behaviours)  # estimate costs per individual for the initial health state. Trt = FALSE. This was because both current and proposed practice individuals will be on waitlist and the cost will be same initially
+     
+     
+     m.E[i, 1] <-  Effs(m.M[i, 1], previous_state, Trt, 0.25, current_utilities)  # estimate costs per individual for the initial health state. Trt = FALSE. This was because both current and proposed practice individuals will be on waitlist and the qalys will be same initially
+     
+     
+     for (t in 1:n_t) {
+       # adjusted to prevent out-of-bounds when accessing t+1
+       current_state <- m.M[i, t]
+       
+       current_probs <- df_psa_input_probs[index, ]
+       
+       # Calculate transition probabilities using the current state and PSA-adjusted parameters
+       v.p.it <- Probs_pp(current_state, current_probs)
+       # Ensure that there's at least one possible transition
+       if (sum(v.p.it, na.rm = TRUE) == 0) {
+         stop(paste("No possible transitions from state", current_state))
+       }
+       
+        # Sampling the next state based on probabilities
+        next_state <- sample(v_names_health_states, size = 1, prob = v.p.it)
+
+        # Updating matrix for the next state
+        m.M[i, t + 1] <- next_state
+
+        # Calculate costs and effects for the new state, now using t+1
+        m.C[i, t + 1] <- Costs_pp(next_state, current_state, Trt, current_costs, current_probs, per_effect_increased_risk_behaviours) 
+        m.E[i, t + 1] <- Effs(next_state, current_state, Trt, 0.25, current_utilities)  
+
+        # Update previous_state for the next cycle
+        previous_state <- current_state
+     }
+     
+     # if (i / 100 == round(i / 100, 0)) {
+     #     # Display the progress of the simulation
+     #     cat('\r', paste(i / n_c * 100, "% done", sep = " "))
+     # }
+     
+     # Display individual progress within each simulation
+     cat(sprintf(
+       "\rSimulation %d of %d - %d%% of individuals processed.",
+       sim_idx,
+       n_sim,
+       round(i / n_c * 100)
+     ))
+     
+     
+   }
+        
+    tc <-
+      m.C %*% v.dwc       # total (discounted) cost per individual
+    te <-
+      m.E %*% v.dwe       # total (discounted) QALYs per individual
+    
+    tc_hat <- mean(tc)        # average (discounted) cost
+    te_hat <- mean(te)        # average (discounted) QALYs
+ 
+    if (TS.out == TRUE) {
+      ## Initialize a matrix for storing transitions
+      TS <- matrix(ncol = n_t + 1, nrow = n_c)
+      
+      # Populate the matrix with transitions
+      for (j in 1:n_c) {
+        for (k in 1:n_t) {
+          TS[j, k] <- paste(m.M[j, k], m.M[j, k + 1], sep = "->")
+        }
+        # Ensure the last transition stays within the same state
+        TS[j, n_t + 1] <- paste(m.M[j, n_t + 1], m.M[j, n_t + 1], sep = "->")
+      }
+      
+      # Set row and column names
+      rownames(TS) <- paste("Ind", 1:n_c, sep = " ")
+      colnames(TS) <- paste("Cycle", 0:n_t, sep = " ")
+    } else {
+      TS <- NULL
+    }
+    
+    if (TR.out == TRUE) {
+      # create a trace from the individual trajectories
+      TR <-
+        t(apply(m.M, 2, function(x)
+          table(
+            factor(x, levels = v_names_health_states, ordered = TRUE)
+          ))) # rows are cycles and columns are health state names. Number of individuals at each cyle in health states
+      TR <-
+        TR / n_c # create a distribution trace
+      rownames(TR) <-
+        paste("Cycle", 0:n_t, sep = " ") # name the rows
+      colnames(TR) <-
+        v_names_health_states # name the columns
+    } else {
+      TR <- NULL
+    }
+    
+    results <-
+      list(
+        m.M = m.M,
+        m.C = m.C,
+        m.E = m.E,
+        tc = tc,
+        te = te,
+        tc_hat = tc_hat,
+        te_hat = te_hat,
+        TS = TS,
+        TR = TR
+      ) # store the results from the simulation in a list
+    return(results)  # return the results
+    # end of the MicroSim function
+  }
+```
+
+
+# Microsim function for the current practice
+
+```{r}
+Microsim_cp <-
+  function(v_m_on_waitlist,
+           n_c,
+           n_t,
+           v_names_health_states,
+           d.c,
+           d.e,
+           index,
+           df_psa_input_costs,
+           df_psa_input_utils,
+           df_psa_input_probs,
+           sim_idx, n_sim,
+           TR.out = TRUE,
+           TS.out = TRUE,
+           Trt = FALSE,
+           seed = 1) {
+   
+    v.dwc <- 1 / (1 + d.c) ^ (0:n_t)   # cost discount weight based on the discount rate d.c
+    v.dwe <- 1 / (1 + d.e) ^ (0:n_t)   # QALY discount weight based on the discount rate d.e
+    
+    # matrix capturing the state name/costs/health outcomes for all individuals at each time point
+    m.M <- m.C <- m.E <-  matrix(nrow = n_c,
+                                 ncol = n_t + 1,
+                                 dimnames = list(paste("ind", 1:n_c, sep = " "),
+                                                 paste("cycle", 0:n_t, sep = " ")))
+    
+    m.M[, 1] <- v_m_on_waitlist   # initial health state for all individuals
+    
+   for (i in 1:n_c) {
+      set.seed(seed + i)  # set the seed for every individual for the random number generator
+    
+      previous_state <- NA  # Initializing previous state
+    
+     m.C[i, 1] <- Costs_cp(m.M[i, 1], previous_state, Trt, current_costs)  # estimate costs per individual for the initial health state. Trt = FALSE. This was because both current and proposed practice individuals will be on waitlist and the cost will be same initially
+     
+     
+    m.E[i, 1] <- Effs(m.M[i, 1], previous_state, Trt, 0.25, current_utilities)  # estimate costs per individual for the initial health state. Trt = FALSE. This was because both current and proposed practice individuals will be on waitlist and the qalys will be same initially
+     
+     
+     for (t in 1:n_t) {
+       # adjusted to prevent out-of-bounds when accessing t+1
+       current_state <- m.M[i, t]
+       
+       current_probs <- df_psa_input_probs[index, ]
+       
+       # Calculate transition probabilities using the current state and PSA-adjusted parameters
+       v.p.it <- Probs_cp(current_state, current_probs)
+       # Ensure that there's at least one possible transition
+       if (sum(v.p.it, na.rm = TRUE) == 0) {
+         stop(paste("No possible transitions from state", current_state))
+       }
+       
+        # Sampling the next state based on probabilities
+        next_state <- sample(v_names_health_states, size = 1, prob = v.p.it)
+
+        # Updating matrix for the next state
+        m.M[i, t + 1] <- next_state
+
+        # Calculate costs and effects for the new state, now using t + 1
+        m.C[i, t + 1] <- Costs_cp(next_state, current_state, Trt, current_costs)
+        m.E[i, t + 1] <-  Effs(next_state, current_state, Trt, 0.25, current_utilities)
+        
+        # Update previous_state for the next cycle
+        previous_state <- current_state
+     }
+    
+    # if (i / 100 == round(i / 100, 0)) {
+    #     # Display the progress of the simulation
+    #     cat('\r', paste(i / n_c * 100, "% done", sep = " "))
+    # }
+    
+    # Display individual progress within each simulation
+    cat(sprintf(
+      "\rSimulation %d of %d - %d%% of individuals processed.",
+      sim_idx,
+      n_sim,
+      round(i / n_c * 100)
+    ))
+    
+}
+    
+    tc <-
+      m.C %*% v.dwc       # total (discounted) cost per individual
+    te <-
+      m.E %*% v.dwe       # total (discounted) QALYs per individual
+    
+    tc_hat <- mean(tc)        # average (discounted) cost
+    te_hat <- mean(te)        # average (discounted) QALYs
+    
+    if (TS.out == TRUE) {
+      # Initialize a matrix for storing transitions
+      TS <- matrix(ncol = n_t + 1, nrow = n_c)
+      
+      # Populate the matrix with transitions
+      for (j in 1:n_c) {
+        for (k in 1:n_t) {
+          TS[j, k] <- paste(m.M[j, k], m.M[j, k + 1], sep = "->")
+        }
+        # Ensure the last transition stays within the same state
+        TS[j, n_t + 1] <- paste(m.M[j, n_t + 1], m.M[j, n_t + 1], sep = "->")
+      }
+      
+      # Set row and column names
+      rownames(TS) <- paste("Ind", 1:n_c, sep = " ")
+      colnames(TS) <- paste("Cycle", 0:n_t, sep = " ")
+    } else {
+      TS <- NULL
+    }
+    
+    if (TR.out == TRUE) {
+      # create a trace from the individual trajectories
+      TR <-
+        t(apply(m.M, 2, function(x)
+          table(
+            factor(x, levels = v_names_health_states, ordered = TRUE)
+          ))) # rows are cycles and columns are health state names. Number of individuals at each cyle in health states
+      TR <-
+        TR / n_c # create a distribution trace
+      rownames(TR) <-
+        paste("Cycle", 0:n_t, sep = " ") # name the rows
+      colnames(TR) <-
+        v_names_health_states # name the columns
+    } else {
+      TR <- NULL
+    }
+    
+    results <-
+      list(
+        m.M = m.M,
+        m.C = m.C,
+        m.E = m.E,
+        tc = tc,
+        te = te,
+        tc_hat = tc_hat,
+        te_hat = te_hat,
+        TS = TS,
+        TR = TR
+      ) # store the results from the simulation in a list
+    return(results)  # return the results
+    # end of the MicroSim function
+  }
+```
+
+
+# Function to calculate transition probabilities dynamically for each health state
+```{r}
+calculate_health_state_transitions <- function(current_probs) {
+  list(
+    on_waitlist = calculate_on_waitlist_transitions(current_probs, tp_transplant, tp_suspension, per_effect_increased_risk_behaviours, per_effect_hcv),
+    DBD_SCD_good = calculate_DBD_SCD_good_transitions(current_probs),
+    DBD_SCD_moderate = calculate_DBD_SCD_moderate_transitions(current_probs),
+    DBD_SCD_poor = calculate_DBD_SCD_poor_transitions(current_probs),
+    DBD_ECD_good = calculate_DBD_ECD_good_transitions(current_probs),
+    DBD_ECD_moderate = calculate_DBD_ECD_moderate_transitions(current_probs),
+    DBD_ECD_poor = calculate_DBD_ECD_poor_transitions(current_probs),
+    DCD_good = calculate_DCD_good_transitions(current_probs),
+    DCD_moderate = calculate_DCD_moderate_transitions(current_probs),
+    DCD_poor = calculate_DCD_poor_transitions(current_probs),
+    
+    
+    on_waitlist_cp = calculate_on_waitlist_transitions_cp(current_probs, tp_transplant, tp_suspension),
+    DBD_SCD_good_cp = calculate_DBD_SCD_good_transitions_cp(current_probs),
+    DBD_SCD_moderate_cp = calculate_DBD_SCD_moderate_transitions_cp(current_probs),
+    DBD_SCD_poor_cp = calculate_DBD_SCD_poor_transitions_cp(current_probs),
+    DBD_ECD_good_cp = calculate_DBD_ECD_good_transitions_cp(current_probs),
+    DBD_ECD_moderate_cp = calculate_DBD_ECD_moderate_transitions_cp(current_probs),
+    DBD_ECD_poor_cp = calculate_DBD_ECD_poor_transitions_cp(current_probs),
+    DCD_good_cp = calculate_DCD_good_transitions_cp(current_probs),
+    DCD_moderate_cp = calculate_DCD_moderate_transitions_cp(current_probs),
+    DCD_poor_cp = calculate_DCD_poor_transitions_cp(current_probs),
+    
+    
+    gg_DBDSCD = calculate_gg_DBDSCD_transitions(current_probs),
+    mg_DBDSCD = calculate_mg_DBDSCD_transitions(current_probs),
+    pg_DBDSCD = calculate_pg_DBDSCD_transitions(current_probs),
+     
+    gg_DBDECD = calculate_gg_DBDECD_transitions(current_probs),
+    mg_DBDECD = calculate_mg_DBDECD_transitions(current_probs),
+    pg_DBDECD = calculate_pg_DBDECD_transitions(current_probs),
+    
+    gg_DCD = calculate_gg_DCD_transitions(current_probs),
+    mg_DCD = calculate_mg_DCD_transitions(current_probs),
+    pg_DCD = calculate_pg_DCD_transitions(current_probs),
+    
+    off_waitlist = calculate_off_waitlist_transitions(current_probs),
+    
+    HIV = calculate_hiv_transitions(current_probs),
+    HBV = calculate_hbv_transitions(current_probs),
+    HCV = calculate_hcv_transitions(current_probs),
+    
+    Hbv_comp = calculate_hbv_comp_transitions(current_probs),
+    Hcv_comp = calculate_hcv_comp_transitions(current_probs),
+    Hbv_decomp = calculate_hbv_decomp_transitions(current_probs),
+    Hcv_decomp = calculate_hcv_decomp_transitions(current_probs),
+    Hbv_hcc = calculate_hbv_hcc_transitions(current_probs),
+    Hcv_hcc = calculate_hcv_hcc_transitions(current_probs),
+    
+    spon_clear = calculate_spon_clear_transitions(current_probs),
+    svr = calculate_svr_transitions(current_probs),
+    liver_transplant = calculate_lt_transitions(current_probs),
+    death = calculate_death_transitions(current_probs),
+)
+}
+
+```
+
+# Helper function
+```{r}
+# Helper function to calculate blood group-based transitions for transplantation
+calculate_bloodgrp_transitions_transplant <- function(current_probs) {
+  
+  return(
+    tp_transplant_bloodgrp_A * current_probs$pro_blood_group_A +
+      tp_transplant_bloodgrp_B * current_probs$pro_blood_grp_B +
+      tp_transplant_bloodgrp_AB * current_probs$pro_blood_grp_AB +
+      tp_transplant_bloodgrp_O * current_probs$pro_blood_grp_O
+  )
+}
+
+# Helper function to calculate blood group-based transitions for suspension
+calculate_bloodgrp_transitions_suspension <- function(current_probs) {
+  return(
+    current_probs$tp_off_waitlist_bloodgrp_A * current_probs$pro_blood_group_A +
+      current_probs$tp_off_waitlist_bloodgrp_B * current_probs$pro_blood_grp_B +
+      current_probs$tp_off_waitlist_bloodgrp_AB * current_probs$pro_blood_grp_AB +
+      current_probs$tp_off_waitlist_bloodgrp_O * current_probs$pro_blood_grp_O
+  )
+}
+```
+
+
+
+# Proposed practice - Define transition probabilities for different health states
+## On waitlist transitions
+```{r}
+# Function to calculate 'On Waitlist' transitions dynamically
+calculate_on_waitlist_transitions <- function(current_probs,
+                                              calculate_bloodgrp_transitions_transplant,
+                                              calculate_bloodgrp_transitions_suspension,
+                                              per_effect_increased_risk_behaviours,
+                                              per_effect_hcv) {
+  
+  # Setup probability parameters for current simulation
+  pro_blood_grp <- list(
+    A = current_probs$pro_blood_group_A,
+    B = current_probs$pro_blood_grp_B,
+    AB = current_probs$pro_blood_grp_AB,
+    O = current_probs$pro_blood_grp_O
+  )
+  
+  # Calculate transitions for transplant and suspension using blood group proportions
+  bloodgrp_transition_transplant_DBDSCD = round(
+    calculate_bloodgrp_transitions_transplant(current_probs) * current_probs$pro_DBDSCD,
+    3
+  )
+  bloodgrp_transition_transplant_DBDECD = round(
+    calculate_bloodgrp_transitions_transplant(current_probs) * current_probs$pro_DBDECD,
+    3
+  )
+  bloodgrp_transition_transplant_DCD = round(
+    calculate_bloodgrp_transitions_transplant(current_probs) * current_probs$pro_DCD,
+    3
+  )
+  
+  bloodgrp_transition_suspension_DBDSCD = round(
+    calculate_bloodgrp_transitions_suspension(current_probs) * current_probs$pro_DBDSCD,
+    3
+  )
+  bloodgrp_transition_suspension_DBDECD = round(
+    calculate_bloodgrp_transitions_suspension(current_probs) * current_probs$pro_DBDECD,
+    3
+  )
+  bloodgrp_transition_suspension_DCD = round(
+    calculate_bloodgrp_transitions_suspension(current_probs) * current_probs$pro_DCD,
+    3
+  )
+  
+  susp_prob <-
+    bloodgrp_transition_suspension_DBDSCD + bloodgrp_transition_suspension_DBDECD + bloodgrp_transition_suspension_DCD
+  
+  tx_fail_to_off_wlst <-
+    round(
+      bloodgrp_transition_transplant_DBDSCD *  current_probs$tp_graft_failure +
+        bloodgrp_transition_transplant_DBDECD * current_probs$tp_graft_failure +
+        bloodgrp_transition_transplant_DCD * current_probs$tp_graft_failure, 4)
+  
+  # Assemble the transitions into a named vector
+  transitions <- c("On waitlist" = 1 - sum(round(bloodgrp_transition_transplant_DBDSCD * (1 - current_probs$pro_DBDSCD_mg - current_probs$pro_DBDSCD_pg - current_probs$tp_graft_failure),4),
+                            
+    round(per_effect_increased_risk_behaviours * (1 - current_probs$pro_DBDSCD_mg - current_probs$pro_DBDSCD_pg - current_probs$tp_graft_failure),4),
+      
+      round(bloodgrp_transition_transplant_DBDSCD * current_probs$pro_DBDSCD_mg, 4),
+      
+      round(current_probs$pro_DBDSCD_mg * per_effect_increased_risk_behaviours, 4),
+      
+      round(bloodgrp_transition_transplant_DBDSCD * current_probs$pro_DBDSCD_pg, 4),
+      
+      round(current_probs$pro_DBDSCD_pg * per_effect_increased_risk_behaviours, 4),
+      
+    round(bloodgrp_transition_transplant_DBDECD * (1 - current_probs$pro_DBDECD_mg - current_probs$pro_DBDECD_pg - current_probs$tp_graft_failure),4),
+    round(bloodgrp_transition_transplant_DBDECD * current_probs$pro_DBDECD_mg, 4),
+    round(bloodgrp_transition_transplant_DBDECD * current_probs$pro_DBDECD_pg, 4),
+    round(bloodgrp_transition_transplant_DCD * (1 - current_probs$pro_DCD_mg - current_probs$pro_DCD_pg - current_probs$tp_graft_failure),4),
+    round(bloodgrp_transition_transplant_DCD * current_probs$pro_DCD_mg, 4),
+    round(bloodgrp_transition_transplant_DCD * current_probs$pro_DCD_pg, 4),
+    round(susp_prob + tx_fail_to_off_wlst, 4),
+    per_effect_hcv,
+    current_probs$n_death_waitlist),
+    
+    "DBD SCD good" = round(bloodgrp_transition_transplant_DBDSCD * (
+      1 - current_probs$pro_DBDSCD_mg - current_probs$pro_DBDSCD_pg - current_probs$tp_graft_failure), 4) +
+      
+      round(per_effect_increased_risk_behaviours * (
+        1 - current_probs$pro_DBDSCD_mg - current_probs$pro_DBDSCD_pg - current_probs$tp_graft_failure), 4),
+    
+    "DBD SCD moderate" = round(bloodgrp_transition_transplant_DBDSCD * current_probs$pro_DBDSCD_mg, 4) + round(current_probs$pro_DBDSCD_mg * per_effect_increased_risk_behaviours, 4),
+    
+    "DBD SCD poor" = round(bloodgrp_transition_transplant_DBDSCD * current_probs$pro_DBDSCD_pg, 4) + round(current_probs$pro_DBDSCD_pg * per_effect_increased_risk_behaviours, 4),
+    
+    "DBD ECD good" = round(bloodgrp_transition_transplant_DBDECD * (
+      1 - current_probs$pro_DBDECD_mg - current_probs$pro_DBDECD_pg - current_probs$tp_graft_failure), 4),
+    
+    "DBD ECD moderate" = round(bloodgrp_transition_transplant_DBDECD * current_probs$pro_DBDECD_mg, 4),
+    
+    "DBD ECD poor" = round(bloodgrp_transition_transplant_DBDECD * current_probs$pro_DBDECD_pg, 4),
+    
+    "DCD good" = round(bloodgrp_transition_transplant_DCD * (
+      1 - current_probs$pro_DCD_mg - current_probs$pro_DCD_pg - current_probs$tp_graft_failure), 4),
+    
+    "DCD moderate" = round(bloodgrp_transition_transplant_DCD * current_probs$pro_DCD_mg, 4),
+    
+    "DCD poor" = round(bloodgrp_transition_transplant_DCD * current_probs$pro_DCD_pg, 4),
+    
+    "Off waitlist" = round(susp_prob + tx_fail_to_off_wlst, 4),
+    
+    "HCV" = per_effect_hcv,
+    
+    "Death on waitlist" = current_probs$n_death_waitlist)
+  
+  return(transitions)
+}
+
+```
+
+
+## DBD SCD
+```{r}
+#good
+calculate_DBD_SCD_good_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_SCD_good_transitions <- c(
+    "Good graft DBD SCD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_SCD_good_transitions)
+}
+
+#moderate
+calculate_DBD_SCD_moderate_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_SCD_moderate_transitions <- c(
+    "Moderate graft DBD SCD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_SCD_moderate_transitions)
+}
+
+#poor
+calculate_DBD_SCD_poor_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_SCD_poor_transitions <- c(
+    "Poor graft DBD SCD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_SCD_poor_transitions)
+}
+```
+
+## DBD ECD
+```{r}
+#good
+calculate_DBD_ECD_good_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_ECD_good_transitions <- c(
+    "Good graft DBD ECD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_ECD_good_transitions)
+}
+
+#moderate
+calculate_DBD_ECD_moderate_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_ECD_moderate_transitions <- c(
+    "Moderate graft DBD ECD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_ECD_moderate_transitions)
+}
+
+#poor
+calculate_DBD_ECD_poor_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_ECD_poor_transitions <- c(
+    "Poor graft DBD ECD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_ECD_poor_transitions)
+}
+```
+
+## DCD
+```{r}
+#good
+calculate_DCD_good_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DCD_good_transitions <- c(
+    "Good graft DCD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DCD_good_transitions)
+}
+
+#moderate
+calculate_DCD_moderate_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DCD_moderate_transitions <- c(
+    "Moderate graft DCD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DCD_moderate_transitions)
+}
+
+#poor
+calculate_DCD_poor_transitions <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HIV = round(current_probs$tp_HIV_proposed_practice, 7)
+  transition_to_HBV = round(current_probs$tp_HBV_proposed_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_proposed_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HIV, transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DCD_poor_transitions <- c(
+    "Poor graft DCD" = 1 - total_disease_transitions,
+    "HIV" = transition_to_HIV,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DCD_poor_transitions)
+}
+```
+
+# Current practice - Define transition probabilities for different health states
+## On Waitlist
+```{r}
+# Function to calculate 'On Waitlist' transitions dynamically
+calculate_on_waitlist_transitions_cp <- function(current_probs, calculate_bloodgrp_transitions_transplant, calculate_bloodgrp_transitions_suspension) {
+
+  # Setup probability parameters for current simulation
+  pro_blood_grp <- list(
+    A = current_probs$pro_blood_group_A,
+    B = current_probs$pro_blood_grp_B,
+    AB = current_probs$pro_blood_grp_AB,
+    O = current_probs$pro_blood_grp_O
+  )
+  
+
+ # Calculate transitions for transplant and suspension using blood group proportions
+  bloodgrp_transition_transplant_DBDSCD = round(
+    calculate_bloodgrp_transitions_transplant(current_probs) * current_probs$pro_DBDSCD,
+    3
+  )
+  bloodgrp_transition_transplant_DBDECD = round(
+    calculate_bloodgrp_transitions_transplant(current_probs) * current_probs$pro_DBDECD,
+    3
+  )
+  bloodgrp_transition_transplant_DCD = round(
+    calculate_bloodgrp_transitions_transplant(current_probs) * current_probs$pro_DCD,
+    3
+  )
+  
+  bloodgrp_transition_suspension_DBDSCD = round(
+    calculate_bloodgrp_transitions_suspension(current_probs) * current_probs$pro_DBDSCD,
+    3
+  )
+  bloodgrp_transition_suspension_DBDECD = round(
+    calculate_bloodgrp_transitions_suspension(current_probs) * current_probs$pro_DBDECD,
+    3
+  )
+  bloodgrp_transition_suspension_DCD = round(
+    calculate_bloodgrp_transitions_suspension(current_probs) * current_probs$pro_DCD,
+    3
+  )
+  
+  susp_prob <-
+    bloodgrp_transition_suspension_DBDSCD + bloodgrp_transition_suspension_DBDECD + bloodgrp_transition_suspension_DCD
+  
+  tx_fail_to_off_wlst <-
+    round(
+      bloodgrp_transition_transplant_DBDSCD *  current_probs$tp_graft_failure +
+        bloodgrp_transition_transplant_DBDECD * current_probs$tp_graft_failure +
+        bloodgrp_transition_transplant_DCD * current_probs$tp_graft_failure, 4)
+  
+ # Assemble the transitions into a named vector
+  transitions <- c(
+    "On waitlist" = 1 - sum(round(bloodgrp_transition_transplant_DBDSCD * (1 - current_probs$pro_DBDSCD_mg - current_probs$pro_DBDSCD_pg - current_probs$tp_graft_failure),4),
+     
+    round(bloodgrp_transition_transplant_DBDSCD * current_probs$pro_DBDSCD_mg, 4),
+      
+    round(bloodgrp_transition_transplant_DBDSCD * current_probs$pro_DBDSCD_pg, 4),
+      
+    round(bloodgrp_transition_transplant_DBDECD * (1 - current_probs$pro_DBDECD_mg - current_probs$pro_DBDECD_pg - current_probs$tp_graft_failure),4),
+    
+    round(bloodgrp_transition_transplant_DBDECD * current_probs$pro_DBDECD_mg, 4),
+    
+    round(bloodgrp_transition_transplant_DBDECD * current_probs$pro_DBDECD_pg, 4),
+    
+    round(bloodgrp_transition_transplant_DCD * (1 - current_probs$pro_DCD_mg - current_probs$pro_DCD_pg - current_probs$tp_graft_failure),4),
+    
+    round(bloodgrp_transition_transplant_DCD * current_probs$pro_DCD_mg, 4),
+    
+    round(bloodgrp_transition_transplant_DCD * current_probs$pro_DCD_pg, 4),
+    
+    round(susp_prob + tx_fail_to_off_wlst, 4),
+    
+    current_probs$n_death_waitlist),
+    
+    "DBD SCD good" = round(bloodgrp_transition_transplant_DBDSCD * (
+      1 - current_probs$pro_DBDSCD_mg - current_probs$pro_DBDSCD_pg - current_probs$tp_graft_failure), 4),
+      
+    "DBD SCD moderate" = round(bloodgrp_transition_transplant_DBDSCD * current_probs$pro_DBDSCD_mg, 4),
+
+    "DBD SCD poor" = round(bloodgrp_transition_transplant_DBDSCD * current_probs$pro_DBDSCD_pg, 4),
+    
+    "DBD ECD good" = round(bloodgrp_transition_transplant_DBDECD * (
+      1 - current_probs$pro_DBDECD_mg - current_probs$pro_DBDECD_pg - current_probs$tp_graft_failure), 4),
+    
+    "DBD ECD moderate" = round(bloodgrp_transition_transplant_DBDECD * current_probs$pro_DBDECD_mg, 4),
+    
+    "DBD ECD poor" = round(bloodgrp_transition_transplant_DBDECD * current_probs$pro_DBDECD_pg, 4),
+    
+    "DCD good" = round(bloodgrp_transition_transplant_DCD * (
+      1 - current_probs$pro_DCD_mg - current_probs$pro_DCD_pg - current_probs$tp_graft_failure), 4),
+    
+    "DCD moderate" = round(bloodgrp_transition_transplant_DCD * current_probs$pro_DCD_mg, 4),
+    
+    "DCD poor" = round(bloodgrp_transition_transplant_DCD * current_probs$pro_DCD_pg, 4),
+    
+    "Off waitlist" = round(susp_prob + tx_fail_to_off_wlst, 4),
+    
+    "Death on waitlist" = current_probs$n_death_waitlist)
+  
+  return(transitions)
+}
+```
+
+## DBD SCD
+```{r}
+#good
+calculate_DBD_SCD_good_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_SCD_good_transitions <- c(
+    "Good graft DBD SCD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_SCD_good_transitions)
+}
+
+#moderate
+calculate_DBD_SCD_moderate_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum( transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_SCD_moderate_transitions <- c(
+    "Moderate graft DBD SCD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_SCD_moderate_transitions)
+}
+
+#poor
+calculate_DBD_SCD_poor_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_SCD_poor_transitions <- c(
+    "Poor graft DBD SCD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_SCD_poor_transitions)
+}
+```
+
+## DBD ECD
+```{r}
+#good
+calculate_DBD_ECD_good_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_ECD_good_transitions <- c(
+    "Good graft DBD ECD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_ECD_good_transitions)
+}
+
+#moderate
+calculate_DBD_ECD_moderate_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum( transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_ECD_moderate_transitions <- c(
+    "Moderate graft DBD ECD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_ECD_moderate_transitions)
+}
+
+#poor
+calculate_DBD_ECD_poor_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DBD_ECD_poor_transitions <- c(
+    "Poor graft DBD ECD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DBD_ECD_poor_transitions)
+}
+```
+
+## DCD
+```{r}
+#good
+calculate_DCD_good_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DCD_good_transitions <- c(
+    "Good graft DCD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DCD_good_transitions)
+}
+
+#moderate
+calculate_DCD_moderate_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum( transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DCD_moderate_transitions <- c(
+    "Moderate graft DCD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DCD_moderate_transitions)
+}
+
+#poor
+calculate_DCD_poor_transitions_cp <- function(current_probs) {
+  # Calculate probabilities for transitions
+  transition_to_HBV = round(current_probs$tp_HBV_current_practice, 4)
+  transition_to_HCV = round(current_probs$tp_HCV_current_practice, 5)
+
+  # Sum up all transitions probabilities for diseases
+  total_disease_transitions = sum(transition_to_HBV, transition_to_HCV)
+
+  # Create a vector of transitions with corrected probability for remaining in the good graft state
+  DCD_poor_transitions <- c(
+    "Poor graft DCD" = 1 - total_disease_transitions,
+    "HBV" = transition_to_HBV,
+    "HCV" = transition_to_HCV
+  )
+
+  return(DCD_poor_transitions)
+}
+```
+
+# Common health states in both arms
+
+## Good graft 
+```{r}
+#DBD SCD
+calculate_gg_DBDSCD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  transition_to_moderate = round(current_probs$tp_gm_DBDSCD, 4)
+  transition_to_poor = round(current_probs$tp_gp_DBDSCD, 4)
+  transition_to_death = round(current_probs$tp_gd_DBDSCD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(transition_to_moderate, transition_to_poor, transition_to_death)
+  
+  # Define the transition probabilities for "Good graft DBD SCD"
+  gg_DBDSCD_transitions <- c(
+    "Good graft DBD SCD" = 1 - total_transitions,
+    "Moderate graft DBD SCD" = transition_to_moderate,
+    "Poor graft DBD SCD" = transition_to_poor,
+    "Death w functioning graft" = transition_to_death
+  )
+  
+  return(gg_DBDSCD_transitions)
+}
+
+# DBD ECD
+calculate_gg_DBDECD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  transition_to_moderate = round(current_probs$tp_gm_DBDECD, 4)
+  transition_to_poor = round(current_probs$tp_gp_DBDECD, 4)
+  transition_to_death = round(current_probs$tp_gd_DBDECD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(transition_to_moderate, transition_to_poor, transition_to_death)
+  
+  # Define the transition probabilities for "Good graft DBD SCD"
+  gg_DBDECD_transitions <- c(
+    "Good graft DBD ECD" = 1 - total_transitions,
+    "Moderate graft DBD ECD" = transition_to_moderate,
+    "Poor graft DBD ECD" = transition_to_poor,
+    "Death w functioning graft" = transition_to_death
+  )
+  
+  return(gg_DBDECD_transitions)
+}
+
+# DCD
+calculate_gg_DCD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  transition_to_moderate = round(current_probs$tp_gm_DCD, 4)
+  transition_to_poor = round(current_probs$tp_gp_DCD, 4)
+  transition_to_death = round(current_probs$tp_gd_DCD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(transition_to_moderate, transition_to_poor, transition_to_death)
+  
+  # Define the transition probabilities for "Good graft DBD SCD"
+  gg_DCD_transitions <- c(
+    "Good graft DCD" = 1 - total_transitions,
+    "Moderate graft DCD" = transition_to_moderate,
+    "Poor graft DCD" = transition_to_poor,
+    "Death w functioning graft" = transition_to_death
+  )
+  
+  return(gg_DCD_transitions)
+}
+
+```
+
+## Moderate graft
+```{r}
+# DBD SCD
+calculate_mg_DBDSCD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  transition_to_poor = round(current_probs$tp_mp_DBDSCD, 4)
+  transition_to_death = round(current_probs$tp_md_DBDSCD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(transition_to_poor, transition_to_death)
+  
+   # Define the transition probabilities for "Good graft DBD SCD"
+  mg_DBDSCD_transitions <- c(
+    "Moderate graft DBD SCD" = 1 - total_transitions,
+    "Poor graft DBD SCD" = transition_to_poor,
+    "Death w functioning graft" = transition_to_death
+  )
+  
+  return(mg_DBDSCD_transitions)
+}
+
+# DBD ECD
+calculate_mg_DBDECD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  transition_to_poor = round(current_probs$tp_mp_DBDECD, 4)
+  transition_to_death = round(current_probs$tp_md_DBDECD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(transition_to_poor, transition_to_death)
+  
+   # Define the transition probabilities for "Good graft DBD SCD"
+  mg_DBDECD_transitions <- c(
+    "Moderate graft DBD ECD" = 1 - total_transitions,
+    "Poor graft DBD ECD" = transition_to_poor,
+    "Death w functioning graft" = transition_to_death
+  )
+  
+  return(mg_DBDECD_transitions)
+}
+
+
+# DCD
+calculate_mg_DCD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  transition_to_poor = round(current_probs$tp_mp_DCD, 4)
+  transition_to_death = round(current_probs$tp_md_DCD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(transition_to_poor, transition_to_death)
+  
+   # Define the transition probabilities for "Good graft DBD SCD"
+  mg_DCD_transitions <- c(
+    "Moderate graft DCD" = 1 - total_transitions,
+    "Poor graft DCD" = transition_to_poor,
+    "Death w functioning graft" = transition_to_death
+  )
+  
+  return(mg_DCD_transitions)
+}
+```
+
+## Poor graft
+```{r}
+# DBD SCD
+calculate_pg_DBDSCD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  graft_failure = round(current_probs$tp_graft_failure, 4)
+  death_after_failure = round(current_probs$tp_peskd_DBDSCD, 4)
+  death_with_functioning_graft = round(current_probs$tp_pd_DBDSCD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(graft_failure, death_after_failure, death_with_functioning_graft)
+  
+  # Define the transition probabilities for "Poor graft DBD SCD"
+  pg_DBDSCD_transitions <- c(
+    "Poor graft DBD SCD" = 1 - total_transitions,
+    "Off waitlist" = graft_failure,
+    "Death after graft failure" = death_after_failure,
+    "Death w functioning graft" = death_with_functioning_graft
+  )
+  
+  return(pg_DBDSCD_transitions)
+}
+
+
+# DBD ECD
+calculate_pg_DBDECD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  graft_failure = round(current_probs$tp_graft_failure, 4)
+  death_after_failure = round(current_probs$tp_peskd_DBDECD, 4)
+  death_with_functioning_graft = round(current_probs$tp_pd_DBDECD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(graft_failure, death_after_failure, death_with_functioning_graft)
+  
+  # Define the transition probabilities for "Poor graft DBD SCD"
+  pg_DBDECD_transitions <- c(
+    "Poor graft DBD ECD" = 1 - total_transitions,
+    "Off waitlist" = graft_failure,
+    "Death after graft failure" = death_after_failure,
+    "Death w functioning graft" = death_with_functioning_graft
+  )
+  
+  return(pg_DBDECD_transitions)
+}
+
+
+# DCD
+calculate_pg_DCD_transitions <- function(current_probs) {
+  
+  # Extract probabilities from the current simulation iteration
+  graft_failure = round(current_probs$tp_graft_failure, 4)
+  death_after_failure = round(current_probs$tp_peskd_DCD, 4)
+  death_with_functioning_graft = round(current_probs$tp_pd_DCD, 4)
+  
+  # Sum up all transition probabilities to other states
+  total_transitions = sum(graft_failure, death_after_failure, death_with_functioning_graft)
+  
+  # Define the transition probabilities for "Poor graft DBD SCD"
+  pg_DCD_transitions <- c(
+    "Poor graft DCD" = 1 - total_transitions,
+    "Off waitlist" = graft_failure,
+    "Death after graft failure" = death_after_failure,
+    "Death w functioning graft" = death_with_functioning_graft
+  )
+  
+  return(pg_DCD_transitions)
+}
+```
+
+## Off waitlist
+```{r}
+calculate_off_waitlist_transitions <- function(current_probs) {
+  tp_back_on_waitlist <- round(current_probs$tp_back_on_waitlist, 3)
+  n_death_off_waitlist <- round(current_probs$n_death_off_waitlist, 4)
+
+  off_waitlist_transitions <- c(
+    "On waitlist" = tp_back_on_waitlist,
+    "Off waitlist" = 1 - tp_back_on_waitlist - n_death_off_waitlist,
+    "Death off waitlist" = n_death_off_waitlist
+  )
+  return(off_waitlist_transitions)
+}
+```
+
+## HIV
+```{r}
+calculate_HIV_transitions <- function(current_probs) {
+  n_death_functioning_graft <- current_probs$n_death_functioning_graft
+
+  HIV_transitions <- c(
+    "HIV" = 1 - n_death_functioning_graft,
+    "Death w functioning graft" = n_death_functioning_graft
+  )
+  return(HIV_transitions)
+}
+```
+
+## HBV
+```{r}
+calculate_HBV_transitions <- function(current_probs) {
+  tp_chb_cc_hepB <- round(current_probs$tp_chb_cc_hepB, 5)
+  tp_chb_hcc <- round(current_probs$tp_chb_hcc, 7)
+  tp_chb_sAgloss_hepB <- round(current_probs$tp_chb_sAgloss_hepB, 4)
+  n_death_functioning_graft <- current_probs$n_death_functioning_graft
+
+  HBV_transitions <- c(
+    "HBV" = 1 - sum(tp_chb_cc_hepB, tp_chb_hcc, tp_chb_sAgloss_hepB, n_death_functioning_graft),
+    "Hep B Comp cirr" = tp_chb_cc_hepB,
+    "Hep B HCC" = tp_chb_hcc,
+    "Spon clearance" = tp_chb_sAgloss_hepB,
+    "Death w functioning graft" = n_death_functioning_graft
+  )
+  return(HBV_transitions)
+}
+```
+
+## HCV
+```{r}
+calculate_HCV_transitions <- function(current_probs) {
+  tp_chc_cc_hepC = round(current_probs$tp_chc_cc_hepC, 5)
+  tp_SVR = round(current_probs$tp_SVR, 3)
+  n_death_functioning_graft = current_probs$n_death_functioning_graft
+
+  HCV_transitions = c(
+    "HCV" = 1 - sum(tp_chc_cc_hepC, tp_SVR, n_death_functioning_graft),
+    "Hep C Comp cirr" = tp_chc_cc_hepC,
+    "SVR" = tp_SVR,
+    "Death w functioning graft" = n_death_functioning_graft
+  )
+  return(HCV_transitions)
+}
+```
+
+## Hep B Comp cirr
+```{r}
+calculate_hbv_comp_transitions <- function(current_probs) {
+  n_death_functioning_graft <- current_probs$n_death_functioning_graft
+  tp_death_cc_hepB <- round(current_probs$tp_death_cc_hepB, 5)
+  tp_cc_dc_hepB <- round(current_probs$tp_cc_dc_hepB, 4)
+  tp_cc_hcc_hepB <- round(current_probs$tp_cc_hcc_hepB, 4)
+
+  HBV_comp_cir_transitions <- c(
+    "Hep B Comp cirr" = 1 - sum(n_death_functioning_graft, tp_death_cc_hepB, tp_cc_dc_hepB, tp_cc_hcc_hepB),
+    "Hep B Decomp cirr" = tp_cc_dc_hepB,
+    "Hep B HCC" = tp_cc_hcc_hepB,
+    "Death w functioning graft" = n_death_functioning_graft,
+    "Death end stage liver" = tp_death_cc_hepB
+  )
+  return(HBV_comp_cir_transitions)
+}
+```
+
+## Hep B Decomp cirr
+```{r}
+calculate_hbv_decomp_transitions <- function(current_probs) {
+  n_death_functioning_graft <- current_probs$n_death_functioning_graft
+  tp_death_dc_hepB <- round(current_probs$tp_death_dc_hepB, 4)
+  tp_dc_hcc_hepB <- round(current_probs$tp_dc_hcc_hepB, 4)
+  tp_dc_lt_hepB <- round(current_probs$tp_dc_lt_hepB, 4)
+
+  HBV_decomp_cir_transitions <- c(
+    "Hep B Decomp cirr" = 1 - sum(n_death_functioning_graft, tp_death_dc_hepB, tp_dc_hcc_hepB, tp_dc_lt_hepB),
+    "Hep B HCC" = tp_dc_hcc_hepB,
+    "Liver transplant 3" = tp_dc_lt_hepB,
+    "Death w functioning graft" = n_death_functioning_graft,
+    "Death end stage liver" = tp_death_dc_hepB
+  )
+  return(HBV_decomp_cir_transitions)
+}
+```
+
+## Hep B HCC
+```{r}
+calculate_HBV_HCC_transitions <- function(current_probs) {
+  n_death_functioning_graft <- current_probs$n_death_functioning_graft
+  tp_death_hcc_hepB <- round(current_probs$tp_death_hcc_hepB, 4)
+  tp_hcc_lt_hepB = round(current_probs$tp_hcc_lt_hepB, 4)
+
+  HBV_HCC_transitions = c(
+    "Hep B HCC" = 1 - sum(n_death_functioning_graft, tp_death_hcc_hepB, tp_hcc_lt_hepB),
+    "Liver transplant 3" = tp_hcc_lt_hepB,
+    "Death w functioning graft" = n_death_functioning_graft,
+    "Death end stage liver" = tp_death_hcc_hepB
+  )
+  return(HBV_HCC_transitions)
+}
+```
+
+## Spon clearance
+```{r}
+calculate_spon_clear_transitions <- function(current_probs) {
+  n_death_functioning_graft = current_probs$n_death_functioning_graft
+
+  Spon_clearance_transitions = c(
+    "Spon clearance" = 1 - n_death_functioning_graft,
+    "Death w functioning graft" = n_death_functioning_graft
+  )
+  return(Spon_clearance_transitions)
+}
+```
+
+## Hep C Comp cirr
+```{r}
+calculate_hcv_comp_transitions <- function(current_probs) {
+  n_death_functioning_graft = current_probs$n_death_functioning_graft
+  tp_cc_dc_hepC = round(current_probs$tp_cc_dc_hepC, 4)
+  tp_cc_hcc_hepC = round(current_probs$tp_cc_hcc_hepC, 4)
+
+  HCV_comp_cirr_transitions = c(
+    "Hep C Comp cirr" = 1 - sum(n_death_functioning_graft, tp_cc_dc_hepC, tp_cc_hcc_hepC),
+    "Hep C Decomp cirr" = tp_cc_dc_hepC,
+    "Hep C HCC" = tp_cc_hcc_hepC,
+    "Death w functioning graft" = n_death_functioning_graft
+  )
+  return(HCV_comp_cirr_transitions)
+}
+```
+
+## Hep C Decomp cirr
+```{r}
+calculate_hcv_decomp_transitions <- function(current_probs) {
+  n_death_functioning_graft = current_probs$n_death_functioning_graft
+  tp_death_dc_hepC = round(current_probs$tp_death_dc_hepC, 4)
+  tp_dc_hcc_hepC = round(current_probs$tp_dc_hcc_hepC, 4)
+  tp_dc_lt_hepC = round(current_probs$tp_dc_lt_hepC, 4)
+
+  HCV_decomp_cirr_transitions = c(
+    "Hep C Decomp cirr" = 1 - sum(n_death_functioning_graft, tp_death_dc_hepC, tp_dc_hcc_hepC, tp_dc_lt_hepC),
+    "Hep C HCC" = tp_dc_hcc_hepC,
+    "Liver transplant 3" = tp_dc_lt_hepC,
+    "Death w functioning graft" = n_death_functioning_graft,
+    "Death end stage liver" = tp_death_dc_hepC
+  )
+  return(HCV_decomp_cirr_transitions)
+}
+```
+
+## Hep C HCC
+```{r}
+calculate_HCV_hcc_transitions <- function(current_probs) {
+  n_death_functioning_graft = current_probs$n_death_functioning_graft
+  tp_death_hcc_hepC = round(current_probs$tp_death_hcc_hepC, 4)
+  tp_hcc_lt_hepC = round(current_probs$tp_hcc_lt_hepC, 4)
+
+  HCV_hcc_transitions = c(
+    "Hep C HCC" = 1 - sum(n_death_functioning_graft, tp_death_hcc_hepC, tp_hcc_lt_hepC),
+    "Liver transplant 3" = tp_hcc_lt_hepC,
+    "Death w functioning graft" = n_death_functioning_graft,
+    "Death end stage liver" = tp_death_hcc_hepC
+  )
+  return(HCV_hcc_transitions)
+}
+```
+
+## SVR
+```{r}
+calculate_svr_transitions <- function(current_probs) {
+  n_death_functioning_graft = current_probs$n_death_functioning_graft
+
+  SVR_transitions = c(
+    "SVR" = 1 - n_death_functioning_graft,
+    "Death w functioning graft" = n_death_functioning_graft
+  )
+  return(SVR_transitions)
+}
+```
+
+## Liver transplant 
+```{r}
+calculate_lt_transitions <- function(current_probs, months) {
+  tp_death_LT = round(current_probs$tp_death_LT, 4)
+
+  if (months == 3) {
+    liver_transitions = c(
+      "Liver transplant 6" = 1 - tp_death_LT,
+      "Death end stage liver" = tp_death_LT
+    )
+  } else if (months == 6) {
+    liver_transitions = c(
+      "Liver transplant 9" = 1 - tp_death_LT,
+      "Death end stage liver" = tp_death_LT
+    )
+  } else if (months == 9) {
+    liver_transitions = c(
+      "Liver transplant 12" = 1 - tp_death_LT,
+      "Death end stage liver" = tp_death_LT
+    )
+  } else if (months == 12) {
+    liver_transitions = c(
+      "Liver transplant yr 2" = 1 - tp_death_LT,
+      "Death end stage liver" = tp_death_LT
+    )
+  }
+  
+  else if (months == 24) {
+    liver_transitions = c(
+      "Liver transplant yr 2" = 1 - tp_death_LT,
+      "Death end stage liver" = tp_death_LT
+    )
+  }
+  return(liver_transitions)
+}
+
+```
+
+## Death 
+```{r}
+calculate_death_transitions <- function() {
+  death_transitions = c(
+    "Death on waitlist" = 1,
+    "Death off waitlist" = 1,
+    "Death after graft failure" = 1,
+    "Death w functioning graft" = 1,
+    "Death end stage liver" = 1
+  )
+  return(death_transitions)
+}
+```
+
+
+# All transitions - proposed practice
+```{r}
+get_current_transitions <- function(current_state, current_probs) {
+  switch(current_state,
+    "On waitlist" = calculate_on_waitlist_transitions(current_probs, calculate_bloodgrp_transitions_transplant, calculate_bloodgrp_transitions_suspension, per_effect_increased_risk_behaviours, per_effect_hcv),
+    "DBD SCD good" = calculate_DBD_SCD_good_transitions(current_probs),
+    "DBD SCD moderate" = calculate_DBD_SCD_moderate_transitions(current_probs),
+    "DBD SCD poor" = calculate_DBD_SCD_poor_transitions(current_probs),
+    "DBD ECD good" = calculate_DBD_ECD_good_transitions(current_probs),
+    "DBD ECD moderate" = calculate_DBD_ECD_moderate_transitions(current_probs),
+    "DBD ECD poor" = calculate_DBD_ECD_poor_transitions(current_probs),
+    "DCD good" = calculate_DCD_good_transitions(current_probs),
+    "DCD moderate" = calculate_DCD_moderate_transitions(current_probs),
+    "DCD poor" = calculate_DCD_poor_transitions(current_probs),
+    "Good graft DBD SCD" = calculate_gg_DBDSCD_transitions(current_probs),
+    "Good graft DBD ECD" = calculate_gg_DBDECD_transitions(current_probs),
+    "Good graft DCD" = calculate_gg_DCD_transitions(current_probs),
+    "Moderate graft DBD SCD" = calculate_mg_DBDSCD_transitions(current_probs),
+    "Moderate graft DBD ECD" = calculate_mg_DBDECD_transitions(current_probs),
+    "Moderate graft DCD" = calculate_mg_DCD_transitions(current_probs),
+    "Poor graft DBD SCD" = calculate_pg_DBDSCD_transitions(current_probs),
+    "Poor graft DBD ECD" = calculate_pg_DBDECD_transitions(current_probs),
+    "Poor graft DCD" = calculate_pg_DCD_transitions(current_probs),
+    "Off waitlist" = calculate_off_waitlist_transitions(current_probs),
+    "HIV" = calculate_HIV_transitions(current_probs),
+    "HBV" = calculate_HBV_transitions(current_probs),
+    "HCV" = calculate_HCV_transitions(current_probs),
+    "Hep B Comp cirr" = calculate_hbv_comp_transitions(current_probs),
+    "Hep B Decomp cirr" = calculate_hbv_decomp_transitions(current_probs),
+    "Hep B HCC" = calculate_HBV_HCC_transitions(current_probs),
+    "Spon clearance" = calculate_spon_clear_transitions(current_probs),
+    "Hep C Comp cirr" = calculate_hcv_comp_transitions(current_probs),
+    "Hep C Decomp cirr" = calculate_hcv_decomp_transitions(current_probs),
+    "Hep C HCC" = calculate_HCV_hcc_transitions(current_probs),
+    "SVR" = calculate_svr_transitions(current_probs),
+    "Liver transplant 3" = calculate_lt_transitions(current_probs, 3),
+    "Liver transplant 6" = calculate_lt_transitions(current_probs, 6),
+    "Liver transplant 9" = calculate_lt_transitions(current_probs, 9),
+    "Liver transplant 12" = calculate_lt_transitions(current_probs, 12),
+    "Liver transplant yr 2" = calculate_lt_transitions(current_probs, 24),
+    "Death" = calculate_death_transitions()
+  )
+}
+```
+
+# Probability function for the proposed practice
+
+```{r}
+Probs_pp <- function(current_state, get_current_transitions) {
+  v.p.it <- rep(0, length(v_names_health_states))
+  names(v.p.it) <- v_names_health_states
+  
+  transitions_for_state <- get_current_transitions(current_state, current_probs)
+  
+  if (!is.null(transitions_for_state)) {
+    for(target_state in names(transitions_for_state)) {
+      v.p.it[target_state] <- transitions_for_state[target_state]
+    }
+    
+    # Handling NA values in the probability vector
+    if (any(is.na(v.p.it))) {
+      cat("NA detected in probabilities from state:", current_state, "\n")
+      print(v.p.it)
+    }
+    
+   # Check if probabilities sum to approximately 1 with a tolerance
+    if (abs(sum(v.p.it, na.rm = TRUE) - 1) > 1e-6) {
+      cat("Probabilities do not sum to 1 from state:", current_state, "\n")
+      print(v.p.it)
+      stop("Invalid probability distribution.")
+    }
+    
+  } else {
+    # Assuming terminal states are correctly recognized
+    if(grepl("Death", current_state)) {
+      v.p.it[current_state] <- 1  # Ensure terminal states self-transition
+    } else {
+      warning(paste("No transitions defined for state:", current_state))
+    }
+  }
+  return(v.p.it)
+}
+
+
+```
+
+
+# All transitions - current
+```{r}
+get_current_transitions_cp <- function(current_state, current_probs) {
+  switch(current_state,
+    "On waitlist" = calculate_on_waitlist_transitions_cp(current_probs, calculate_bloodgrp_transitions_transplant, calculate_bloodgrp_transitions_suspension),
+    "DBD SCD good" = calculate_DBD_SCD_good_transitions_cp(current_probs),
+    "DBD SCD moderate" = calculate_DBD_SCD_moderate_transitions_cp(current_probs),
+    "DBD SCD poor" = calculate_DBD_SCD_poor_transitions_cp(current_probs),
+    "DBD ECD good" = calculate_DBD_ECD_good_transitions_cp(current_probs),
+    "DBD ECD moderate" = calculate_DBD_ECD_moderate_transitions_cp(current_probs),
+    "DBD ECD poor" = calculate_DBD_ECD_poor_transitions_cp(current_probs),
+    "DCD good" = calculate_DCD_good_transitions_cp(current_probs),
+    "DCD moderate" = calculate_DCD_moderate_transitions_cp(current_probs),
+    "DCD poor" = calculate_DCD_poor_transitions_cp(current_probs),
+    "Good graft DBD SCD" = calculate_gg_DBDSCD_transitions(current_probs),
+    "Good graft DBD ECD" = calculate_gg_DBDECD_transitions(current_probs),
+    "Good graft DCD" = calculate_gg_DCD_transitions(current_probs),
+    "Moderate graft DBD SCD" = calculate_mg_DBDSCD_transitions(current_probs),
+    "Moderate graft DBD ECD" = calculate_mg_DBDECD_transitions(current_probs),
+    "Moderate graft DCD" = calculate_mg_DCD_transitions(current_probs),
+    "Poor graft DBD SCD" = calculate_pg_DBDSCD_transitions(current_probs),
+    "Poor graft DBD ECD" = calculate_pg_DBDECD_transitions(current_probs),
+    "Poor graft DCD" = calculate_pg_DCD_transitions(current_probs),
+    "Off waitlist" = calculate_off_waitlist_transitions(current_probs),
+    "HIV" = calculate_HIV_transitions(current_probs),
+    "HBV" = calculate_HBV_transitions(current_probs),
+    "HCV" = calculate_HCV_transitions(current_probs),
+    "Hep B Comp cirr" = calculate_hbv_comp_transitions(current_probs),
+    "Hep B Decomp cirr" = calculate_hbv_decomp_transitions(current_probs),
+    "Hep B HCC" = calculate_HBV_HCC_transitions(current_probs),
+    "Spon clearance" = calculate_spon_clear_transitions(current_probs),
+    "Hep C Comp cirr" = calculate_hcv_comp_transitions(current_probs),
+    "Hep C Decomp cirr" = calculate_hcv_decomp_transitions(current_probs),
+    "Hep C HCC" = calculate_HCV_hcc_transitions(current_probs),
+    "SVR" = calculate_svr_transitions(current_probs),
+    "Liver transplant 3" = calculate_lt_transitions(current_probs, 3),
+    "Liver transplant 6" = calculate_lt_transitions(current_probs, 6),
+    "Liver transplant 9" = calculate_lt_transitions(current_probs, 9),
+    "Liver transplant 12" = calculate_lt_transitions(current_probs, 12),
+    "Liver transplant yr 2" = calculate_lt_transitions(current_probs, 24),
+    "Death" = calculate_death_transitions()
+  )
+}
+```
+
+# Probability function for the current practice
+
+```{r}
+Probs_cp <- function(current_state, get_current_transitions_cp) {
+  v.p.it <- rep(0, length(v_names_health_states))
+  names(v.p.it) <- v_names_health_states
+  
+  transitions_for_state <- get_current_transitions_cp(current_state, current_probs)
+  
+  if (!is.null(transitions_for_state)) {
+    for(target_state in names(transitions_for_state)) {
+      v.p.it[target_state] <- transitions_for_state[target_state]
+    }
+    
+    # Handling NA values in the probability vector
+    if (any(is.na(v.p.it))) {
+      cat("NA detected in probabilities from state:", current_state, "\n")
+      print(v.p.it)
+    }
+    
+    # Check if probabilities sum to approximately 1 with a tolerance
+    if (abs(sum(v.p.it, na.rm = TRUE) - 1) > 1e-6) {
+      cat("Probabilities do not sum to 1 from state:", current_state, "\n")
+      print(v.p.it)
+      stop("Invalid probability distribution.")
+    }
+    
+  } else {
+    # Assuming terminal states are correctly recognized
+    if(grepl("Death", current_state)) {
+      v.p.it[current_state] <- 1  # Ensure terminal states self-transition
+    } else {
+      warning(paste("No transitions defined for state:", current_state))
+    }
+  }
+  return(v.p.it)
+}
+
+```
+
+
+# Cost function for proposed practice 
+
+```{r}
+Costs_pp <- function(M_it,
+                     previous_state = NULL,
+                     Trt = FALSE,
+                     current_costs,
+                     current_probs,
+                     per_effect_increased_risk_behaviours) {
+ 
+   c.it <- 0  # Initialize cost
+  
+  if (M_it == "On waitlist") {
+    c.it <- sum((
+      current_costs$pro_HD * current_costs$c_in_centre_haemodialysis
+    ),
+    (
+      current_costs$pro_PD * current_costs$c_peritoneal_dialysis
+    ),
+    (
+      current_costs$pro_HHD * current_costs$c_home_haemodialysis
+    )
+    ) * cycle_length
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "Off waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "Off waitlist") {
+      c.it <- c.it + current_costs$c_work_up_transplant_waitlist  # cost for transplant workup for getting back on waitlist
+    }
+    
+  }
+  
+  if (M_it == "DBD SCD good") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+    
+    # # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "On waitlist") {
+      c.it <- c.it + ((current_costs$c_kidney_transplant_year_1 +
+          current_costs$c_follow_up +
+          c_diagosis_proposed_policy +
+          current_costs$c_proph_hepB) * (per_effect_increased_risk_behaviours))
+    }
+  }
+  
+  if (M_it == "DBD SCD moderate") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+    
+    #  # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "On waitlist") {
+      c.it <- c.it + ((current_costs$c_kidney_transplant_year_1 +
+          current_costs$c_follow_up +
+          c_diagosis_proposed_policy +
+          current_costs$c_proph_hepB) * (per_effect_increased_risk_behaviours))
+    }
+  }
+    
+  
+  if (M_it == "DBD SCD poor") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+    
+    #  # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "On waitlist") {
+      c.it <- c.it + ((current_costs$c_kidney_transplant_year_1 +
+          current_costs$c_follow_up +
+          c_diagosis_proposed_policy +
+          current_costs$c_proph_hepB) * (per_effect_increased_risk_behaviours))
+    }
+  }
+  
+  if (M_it == "DBD ECD good") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DBD ECD moderate") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "DBD ECD poor") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "DCD good") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "DCD moderate") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "DCD poor") {
+    c.it <- current_costs$c_kidney_transplant_year_1
+  } 
+  
+  if (M_it == "Good graft DBD SCD") {
+    c.it <-  current_costs$c_good_graft_post_transplant * cycle_length
+    
+  } 
+  
+  if (M_it == "Good graft DBD ECD") {
+    c.it <-  current_costs$c_good_graft_post_transplant * cycle_length
+    
+  }
+  
+  if (M_it == "Good graft DCD") {
+    c.it <-  current_costs$c_good_graft_post_transplant * cycle_length
+    
+    
+  } 
+  
+  if (M_it == "Moderate graft DBD SCD") {
+    c.it <-  current_costs$c_moderate_graft_post_transplant * cycle_length
+    
+  }
+  
+  if (M_it == "Moderate graft DBD ECD") {
+    c.it <- current_costs$c_moderate_graft_post_transplant * cycle_length
+    
+  } 
+  
+  if (M_it == "Moderate graft DCD") {
+    c.it <- current_costs$c_moderate_graft_post_transplant * cycle_length
+    
+  }
+  
+  if (M_it == "Poor graft DBD SCD") {
+    c.it <-  current_costs$c_poor_graft_post_transplant * cycle_length
+    
+    
+  } 
+  
+  if (M_it == "Poor graft DBD ECD") {
+    c.it <-  current_costs$c_poor_graft_post_transplant * cycle_length
+    
+  }
+  
+  if (M_it == "Poor graft DCD") {
+    c.it <-  current_costs$c_poor_graft_post_transplant * cycle_length
+    
+  } 
+  
+  if (M_it == "Off waitlist") {
+    c.it <- sum((current_costs$pro_HD * current_costs$c_in_centre_haemodialysis),
+                (current_costs$pro_PD * current_costs$c_peritoneal_dialysis),
+                (current_costs$pro_HHD * current_costs$c_home_haemodialysis)
+    ) * cycle_length
+    
+    
+  }
+  
+  if (M_it == "HIV") {
+      c.it <-
+        (current_costs$c_remaining_HIV) * cycle_length
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + as.numeric(current_costs$c_diagnosing_HIV)
+      }
+    }
+  
+    if (M_it == "HBV") {
+      c.it <- current_costs$c_chronic_hepB * cycle_length
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + as.numeric(current_costs$c_diagnosing_hepB)
+      }
+    }
+    
+    
+    if (M_it == "HCV") {
+      c.it <-
+        (current_costs$c_chronic_HCV) * cycle_length
+      
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "On waitlist") {
+        c.it <-
+          c.it +  current_costs$c_kidney_transplant_year_1 +
+          current_costs$c_follow_up + current_costs$c_diagnosing_HCV + mean(
+            current_costs$c_treating_mild_moderate_chronic_hepC_gen1_2 +
+              current_costs$c_treating_mild_moderate_chronic_hepC_gen3)
+        
+      }
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + current_costs$c_diagnosing_HCV + mean(
+            current_costs$c_treating_mild_moderate_chronic_hepC_gen1_2 +
+              current_costs$c_treating_mild_moderate_chronic_hepC_gen3)
+      }
+      
+      
+    }
+
+  
+  if (M_it == "Hep B Comp cirr") {
+    c.it <- current_costs$c_compensated_cirrhosis_hepB * cycle_length
+    
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HBV") {
+        c.it <- c.it + current_costs$c_one_off_transition_to_CC
+      }
+    
+  }
+  
+  if (M_it == "Hep B Decomp cirr") {
+    c.it <- current_costs$c_decompensated_cirrhosis_hepB * cycle_length
+    
+  }
+  
+  if (M_it == "Hep B HCC") {
+    c.it <-  current_costs$c_hepatocellular_carcinoma_hepB * cycle_length
+   
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% c("HBV", "Hep B Comp cirr", "Hep B Decomp cirr")) {
+        c.it <- c.it + current_costs$c_one_off_transition_to_hcc
+      }
+     
+  }
+  
+  if (M_it == "Spon clearance") {
+    c.it <- current_costs$c_chronic_hepB * cycle_length
+    
+  } 
+  
+  if (M_it == "Hep C Comp cirr") {
+    c.it <- current_costs$c_compensated_cirrhosis_hepC * cycle_length
+    
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HCV") {
+        c.it <- c.it + current_costs$c_one_off_transition_to_CC
+      }
+  }
+  
+  if (M_it == "Hep C Decomp cirr") {
+    c.it <- current_costs$c_decompensated_cirrhosis_hepC * cycle_length
+    
+  }
+  
+  if (M_it == "Hep C HCC") {
+    c.it <- current_costs$c_hepatocellular_carcinoma_hepC * cycle_length
+    
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% c("Hep C Comp cirr", "Hep C Decomp cirr")) {
+        c.it <- c.it + current_costs$c_one_off_transition_to_hcc
+      }
+  }
+  
+  if (M_it == "SVR") {
+    c.it <-  current_costs$c_SVR_hepC * cycle_length
+    
+    if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HCV") {
+        c.it <- c.it + current_costs$c_SVR_hepC
+      }
+    
+  } 
+  
+  if (M_it == "Liver transplant 3") {
+    c.it <-  cycle_length * (current_costs$c_liver_transplant_year_1)
+    
+  }
+  
+  if (M_it == "Liver transplant 6") {
+    c.it <- cycle_length * (current_costs$c_liver_transplant_year_1)
+    
+  }
+  if (M_it == "Liver transplant 9") {
+    c.it <- cycle_length * (current_costs$c_liver_transplant_year_1)
+    
+    
+  }
+  
+  if (M_it == "Liver transplant 12") {
+    c.it <- cycle_length * (current_costs$c_liver_transplant_year_1)
+    
+    
+  } 
+  
+  if (M_it == "Liver transplant yr 2") {
+    c.it <- cycle_length * (current_costs$c_liver_transplant_year_2)
+    
+    
+  }
+  
+  if (M_it == "Death on waitlist") {
+    c.it <- 0  # Assuming no cost for "Death on waitlist"
+  }
+  
+  if (M_it == "Death off waitlist") {
+    c.it <- 0  # Assuming no cost for "Death off waitlist"
+  }
+  
+  if (M_it == "Death after graft failure") {
+    c.it <- 0  # Assuming no cost for "Death after graft failure"
+  }
+  
+  if (M_it == "Death w functioning graft") {
+    c.it <- 0  # Assuming no cost for "Death w functioning graft"
+  }
+  
+  if (M_it == "Death end stage liver") {
+    c.it <- 0  # Assuming no cost for "Death end stage liver"
+  }
+  
+  return(c.it)
+}
+
+```
+
+
+# Cost function for current practice
+
+```{r}
+Costs_cp <- function(M_it, previous_state = NULL, Trt = FALSE, current_costs) {
+    c.it <- 0  # Initialize cost
+ 
+  
+   if (M_it == "On waitlist") {
+        c.it <- sum((current_costs$pro_HD * current_costs$c_in_centre_haemodialysis),
+                     (current_costs$pro_PD * current_costs$c_peritoneal_dialysis),
+                     (current_costs$pro_HHD * current_costs$c_home_haemodialysis)
+    ) * cycle_length
+
+        # Check if previous_state is not NA or NULL and if transition occurred from "Off waitlist"
+        if (!is.na(previous_state) && !is.null(previous_state) && previous_state == "Off waitlist") {
+            c.it <- c.it + current_costs$c_work_up_transplant_waitlist  # cost for transplant workup for getting back on waitlist
+        }
+    }
+
+  
+    if (M_it == "DBD SCD good") {
+      c.it <-
+        current_costs$c_kidney_transplant_year_1
+    } 
+  
+  if (M_it == "DBD SCD moderate") {
+    c.it <-
+      current_costs$c_kidney_transplant_year_1  
+    
+  } 
+  
+  if (M_it == "DBD SCD poor") {
+    c.it <-
+      current_costs$c_kidney_transplant_year_1 
+  } 
+  
+  if (M_it == "DBD ECD good") {
+    c.it <-
+      current_costs$c_kidney_transplant_year_1 
+    
+  } 
+  
+  if (M_it == "DBD ECD moderate") {
+    c.it <-
+     current_costs$c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DBD ECD poor") {
+    c.it <-
+      current_costs$c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DCD good") {
+    c.it <-
+      current_costs$c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DCD moderate") {
+    c.it <-
+      current_costs$c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "DCD poor") {
+    c.it <-
+      current_costs$c_kidney_transplant_year_1
+    
+  } 
+  
+  if (M_it == "Good graft DBD SCD") {
+    c.it <-  current_costs$c_good_graft_post_transplant * cycle_length
+    
+  } 
+  
+  if (M_it == "Good graft DBD ECD") {
+    c.it <-  current_costs$c_good_graft_post_transplant * cycle_length
+    
+  }
+  
+  if (M_it == "Good graft DCD") {
+    c.it <-  current_costs$c_good_graft_post_transplant * cycle_length
+    
+    
+  } 
+  
+  if (M_it == "Moderate graft DBD SCD") {
+    c.it <-  current_costs$c_moderate_graft_post_transplant * cycle_length
+    
+  }
+  
+  if (M_it == "Moderate graft DBD ECD") {
+    c.it <- current_costs$c_moderate_graft_post_transplant * cycle_length
+    
+  } 
+  
+  if (M_it == "Moderate graft DCD") {
+    c.it <- current_costs$c_moderate_graft_post_transplant * cycle_length
+    
+  }
+  
+  if (M_it == "Poor graft DBD SCD") {
+    c.it <-  current_costs$c_poor_graft_post_transplant * cycle_length
+    
+    
+  } 
+  
+  if (M_it == "Poor graft DBD ECD") {
+    c.it <-  current_costs$c_poor_graft_post_transplant * cycle_length
+    
+  }
+  
+  if (M_it == "Poor graft DCD") {
+    c.it <-  current_costs$c_poor_graft_post_transplant * cycle_length
+    
+  } 
+  
+  if (M_it == "Off waitlist") {
+    c.it <- sum((current_costs$pro_HD * current_costs$c_in_centre_haemodialysis),
+                (current_costs$pro_PD * current_costs$c_peritoneal_dialysis),
+                (current_costs$pro_HHD * current_costs$c_home_haemodialysis)
+    ) * cycle_length
+    
+    
+  }
+  
+  
+    if (M_it == "HIV") {
+      c.it <- current_costs$c_remaining_HIV * cycle_length
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + as.numeric(current_costs$c_diagnosing_HIV)
+      }
+    }
+  
+    if (M_it == "HBV") {
+      c.it <- current_costs$c_chronic_hepB * cycle_length
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it + as.numeric(current_costs$c_diagnosing_hepB)
+      }
+    }
+    
+    
+    if (M_it == "HCV") {
+      c.it <-
+        (current_costs$c_chronic_HCV) * cycle_length
+      
+      
+      # Define the states from which transition might add additional costs
+      valid_states <- c(
+        "DBD SCD good",
+        "DBD SCD moderate",
+        "DBD SCD poor",
+        "DBD ECD good",
+        "DBD ECD moderate",
+        "DBD ECD poor",
+        "DCD good",
+        "DCD moderate",
+        "DCD poor"
+      )
+      
+      # Check if the previous state is one of the valid states
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% valid_states) {
+        c.it <- c.it +  current_costs$c_diagnosing_HCV + mean(
+            current_costs$c_treating_mild_moderate_chronic_hepC_gen1_2 +
+              current_costs$c_treating_mild_moderate_chronic_hepC_gen3)
+      }
+      
+      
+    }
+
+  
+  if (M_it == "Hep B Comp cirr") {
+    c.it <- current_costs$c_compensated_cirrhosis_hepB * cycle_length
+    
+      if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HBV") {
+        c.it <- c.it + current_costs$c_one_off_transition_to_CC
+      }
+    
+  }
+  
+  if (M_it == "Hep B Decomp cirr") {
+    c.it <- current_costs$c_decompensated_cirrhosis_hepB * cycle_length
+    
+  }
+  
+  if (M_it == "Hep B HCC") {
+    c.it <-  current_costs$c_hepatocellular_carcinoma_hepB * cycle_length
+   
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% c("HBV", "Hep B Comp cirr", "Hep B Decomp cirr")) {
+        c.it <- c.it + current_costs$c_one_off_transition_to_hcc
+      }
+     
+  }
+  
+  if (M_it == "Spon clearance") {
+    c.it <- current_costs$c_chronic_hepB * cycle_length
+    
+  } 
+  
+  if (M_it == "Hep C Comp cirr") {
+    c.it <- current_costs$c_compensated_cirrhosis_hepC * cycle_length
+    
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HCV") {
+        c.it <- c.it + current_costs$c_one_off_transition_to_CC
+      }
+  }
+  
+  if (M_it == "Hep C Decomp cirr") {
+    c.it <- current_costs$c_decompensated_cirrhosis_hepC * cycle_length
+    
+  }
+  
+  if (M_it == "Hep C HCC") {
+    c.it <- current_costs$c_hepatocellular_carcinoma_hepC * cycle_length
+    
+     if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state %in% c("Hep C Comp cirr", "Hep C Decomp cirr")) {
+        c.it <- c.it + current_costs$c_one_off_transition_to_hcc
+      }
+  }
+  
+  if (M_it == "SVR") {
+    c.it <-  current_costs$c_SVR_hepC * cycle_length
+    
+    if (!is.na(previous_state) &&
+          !is.null(previous_state) &&
+          previous_state == "HCV") {
+        c.it <- c.it + current_costs$c_SVR_hepC
+      }
+    
+  } 
+  
+  if (M_it == "Liver transplant 3") {
+    c.it <-  cycle_length * (current_costs$c_liver_transplant_yr_1)
+    
+  }
+  
+  if (M_it == "Liver transplant 6") {
+    c.it <- cycle_length * (current_costs$c_liver_transplant_yr_1)
+    
+  }
+  if (M_it == "Liver transplant 9") {
+    c.it <- cycle_length * (current_costs$c_liver_transplant_yr_1)
+    
+    
+  }
+  
+  if (M_it == "Liver transplant 12") {
+    c.it <- cycle_length * (current_costs$c_liver_transplant_yr_1)
+    
+    
+  } 
+  
+  if (M_it == "Liver transplant yr 2") {
+    c.it <- cycle_length * (current_costs$c_liver_transplant_yr_2)
+    
+    
+  }
+  
+  if (M_it == "Death on waitlist") {
+    c.it <- 0  # Assuming no cost for "Death on waitlist"
+  }
+  
+  if (M_it == "Death off waitlist") {
+    c.it <- 0  # Assuming no cost for "Death off waitlist"
+  }
+  
+  if (M_it == "Death after graft failure") {
+    c.it <- 0  # Assuming no cost for "Death after graft failure"
+  }
+  
+  if (M_it == "Death w functioning graft") {
+    c.it <- 0  # Assuming no cost for "Death w functioning graft"
+  }
+  
+  if (M_it == "Death end stage liver") {
+    c.it <- 0  # Assuming no cost for "Death end stage liver"
+  }
+  
+  return(c.it)
+}
+
+```
+
+# Health outcomes
+```{r}
+Effs <- function(M_it, previous_state = NULL, Trt = FALSE, cl = 0.25, current_utilities) {
+
+  u.it <- 0 # by default the utility for everyone is zero
+   
+  # Assign qalys based on the health state
+  if (M_it == "On waitlist") {
+    u.it <- current_utilities$u_on_waitlist_dialysis
+    
+  }
+  
+  
+  if (M_it == "DBD SCD good") {
+    u.it <- current_utilities$u_transplantation_gg_function
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it + current_utilities$u_transplantation_gg_function
+    }
+  }
+
+  
+  
+  if (M_it == "DBD SCD moderate") {
+    u.it <- current_utilities$u_transplantation_mg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it + current_utilities$u_transplantation_mg_function
+    }
+  }
+  
+  if (M_it == "DBD SCD poor") {
+    u.it <- current_utilities$u_transplantation_pg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it + current_utilities$u_transplantation_pg_function
+    }
+  }
+  
+   if (M_it == "DBD ECD good") {
+    u.it <- current_utilities$u_transplantation_gg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  current_utilities$u_transplantation_gg_function
+    }
+  }
+  
+  if (M_it == "DBD ECD moderate") {
+    u.it <- current_utilities$u_transplantation_mg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  current_utilities$u_transplantation_mg_function
+    }
+  }
+  
+  if (M_it == "DBD ECD poor") {
+    u.it <- current_utilities$u_transplantation_pg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  current_utilities$u_transplantation_pg_function
+    }
+  }
+  
+   if (M_it == "DCD good") {
+    u.it <- current_utilities$u_transplantation_gg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  current_utilities$u_transplantation_gg_function
+    }
+  } 
+  
+  if (M_it == "DCD moderate") {
+    u.it <- current_utilities$u_transplantation_mg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it +  current_utilities$u_transplantation_mg_function
+    }
+  } 
+  
+  if (M_it == "DCD poor") {
+    u.it <- current_utilities$u_transplantation_pg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it + current_utilities$u_transplantation_pg_function
+    }
+  } 
+  
+  if (M_it == "Good graft DBD SCD") {
+    u.it <- current_utilities$u_transplantation_gg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "DBD SCD good") {
+      u.it <- u.it +  current_utilities$u_transplantation_gg_function
+    }
+  } 
+  
+  if (M_it == "Good graft DBD ECD") {
+    u.it <- current_utilities$u_transplantation_gg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "DBD ECD good") {
+      u.it <- u.it +  current_utilities$u_transplantation_gg_function
+    }
+  } 
+  
+  if (M_it == "Good graft DCD") {
+    u.it <- current_utilities$u_transplantation_gg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "DCD good") {
+      u.it <- u.it +  current_utilities$u_transplantation_gg_function
+    }
+  } 
+  
+  if (M_it == "Moderate graft DBD SCD") {
+    u.it <- current_utilities$u_transplantation_mg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in% c("Good graft DBD SCD", "DBD SCD moderate")) {
+      u.it <- u.it +  current_utilities$u_transplantation_mg_function
+    }
+  }
+  
+  if (M_it == "Moderate graft DBD ECD") {
+    u.it <- current_utilities$u_transplantation_mg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in%  c("Good graft DBD ECD", "DBD ECD moderate")) {
+      u.it <- u.it +  current_utilities$u_transplantation_mg_function
+    }
+  }
+  
+  if (M_it == "Moderate graft DCD") {
+    u.it <- current_utilities$u_transplantation_mg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state%in% c("Good graft DCD", "DCD moderate")) {
+      u.it <- u.it +  current_utilities$u_transplantation_mg_function
+    }
+  }
+  
+  
+  if (M_it == "Poor graft DBD SCD") {
+    u.it <- current_utilities$u_transplantation_pg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in% c("Good graft DBD SCD", "Moderate graft DBD SCD", "DBD SCD poor")) {
+      u.it <- u.it +  current_utilities$u_transplantation_pg_function
+    }
+  } 
+  
+  if (M_it == "Poor graft DBD ECD") {
+    u.it <- current_utilities$u_transplantation_pg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in% c("Good graft DBD ECD", "Moderate graft DBD ECD","DBD ECD poor")) {
+      u.it <- u.it +  current_utilities$u_transplantation_pg_function
+    }
+  } 
+  
+  if (M_it == "Poor graft DCD") {
+    u.it <- current_utilities$u_transplantation_pg_function
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state %in% c("Good graft DCD", "Moderate graft DCD","DCD poor")) {
+      u.it <- u.it +  current_utilities$u_transplantation_pg_function
+    }
+  } 
+  
+  if (M_it == "Off waitlist") {
+    u.it <- current_utilities$u_dialysis_temp_off_waitlist 
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) && previous_state == "On waitlist") {
+      u.it <- u.it + current_utilities$u_dialysis_temp_off_waitlist 
+    }
+  }  
+  
+
+  if (M_it == "HIV") {
+    u.it <- current_utilities$u_HIV
+    
+    # Define the states from which transition might add additional costs
+    valid_states <- c(
+      "DBD SCD good",
+      "DBD SCD moderate",
+      "DBD SCD poor",
+      "DBD ECD good",
+      "DBD ECD moderate",
+      "DBD ECD poor",
+      "DCD good",
+      "DCD moderate",
+      "DCD poor"
+    )
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% valid_states) {
+      u.it <- u.it +  current_utilities$u_HIV
+    }
+    
+  } 
+  
+  
+  if (M_it == "HBV") {
+    u.it <- current_utilities$u_CHB_hepB
+    
+    # Define the states from which transition might add additional costs
+    valid_states <- c(
+      "DBD SCD good",
+      "DBD SCD moderate",
+      "DBD SCD poor",
+      "DBD ECD good",
+      "DBD ECD moderate",
+      "DBD ECD poor",
+      "DCD good",
+      "DCD moderate",
+      "DCD poor"
+    )
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% valid_states) {
+      u.it <- u.it + current_utilities$u_CHB_hepB
+    }
+    
+  } 
+  
+  if (M_it == "HCV") {
+    u.it <- current_utilities$u_CHC_hepC
+    
+    # Define the states from which transition might add additional costs
+    valid_states <- c(
+      "DBD SCD good",
+      "DBD SCD moderate",
+      "DBD SCD poor",
+      "DBD ECD good",
+      "DBD ECD moderate",
+      "DBD ECD poor",
+      "DCD good",
+      "DCD moderate",
+      "DCD poor"
+    )
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% valid_states) {
+      u.it <- u.it + current_utilities$u_CHC_hepC
+    }
+    
+  } 
+  
+  if (M_it == "Hep B Comp cirr") {
+    u.it <- current_utilities$u_CC_hepB
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "HBV") {
+      u.it <- u.it +  current_utilities$u_CC_hepB
+    }
+    
+  } 
+  
+  
+  if (M_it == "Hep B Decomp cirr") {
+    u.it <- current_utilities$u_DC_hepB
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "Hep B Comp cirr") {
+      u.it <- u.it +  current_utilities$u_DC_hepB
+    }
+  } 
+  
+  
+  if (M_it == "Hep B HCC") {
+    u.it <- current_utilities$u_HCC_hepB
+    
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% c("HBV", "Hep B Comp cirr", "Hep B Decomp cirr")) {
+      u.it <- u.it +  current_utilities$u_HCC_hepB
+    }
+  } 
+  
+  if (M_it == "Spon clearance") {
+    u.it <- current_utilities$u_sag_clearance
+     # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "HBV") {
+      u.it <- u.it +  current_utilities$u_sag_clearance
+    }
+  } 
+  
+  if (M_it == "Hep C Comp cirr") {
+    u.it <- current_utilities$u_CC_hepC
+    # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "HCV") {
+      u.it <- u.it +  current_utilities$u_CC_hepC
+    }
+  } 
+  
+  if (M_it == "Hep C Decomp cirr") {
+    u.it <- current_utilities$u_DC_hepC
+       # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "Hep C Comp cirr") {
+      u.it <- u.it +  current_utilities$u_DC_hepC
+    }
+  } 
+  
+  if (M_it == "Hep C HCC") {
+    u.it <- current_utilities$u_HCC_hepC
+           # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% c("Hep C Comp cirr", "Hep C Decomp cirr")) {
+      u.it <- u.it +  current_utilities$u_HCC_hepC
+    }
+  } 
+  
+  if (M_it == "SVR") {
+    u.it <- current_utilities$u_SVR_hepC
+        # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state == "HCV") {
+      u.it <- u.it + current_utilities$u_SVR_hepC
+    } 
+  } 
+  
+  if (M_it == "Liver transplant 3") {
+    u.it <- current_utilities$u_liver_transplant_year_1
+              # Check if previous_state is not NA or NULL and if transition occurred from "On waitlist"
+    if (!is.na(previous_state) &&
+        !is.null(previous_state) &&
+        previous_state %in% c("Hep B HCC", "Hep C HCC", "Hep C Decomp cirr", "Hep B Decomp cirr")) {
+      u.it <- u.it + current_utilities$u_liver_transplant_year_1
+    } 
+  } 
+  
+  if (M_it == "Liver transplant 6") {
+    u.it <-  current_utilities$u_liver_transplant_year_1
+    
+  } 
+  
+  if (M_it == "Liver transplant 9") {
+    u.it <-  current_utilities$u_liver_transplant_year_1
+    
+  } 
+  
+  if (M_it == "Liver transplant 12") {
+    u.it <-  current_utilities$u_liver_transplant_year_1
+    
+  } 
+  
+  if (M_it == "Liver transplant yr 2") {
+    u.it <- current_utilities$u_liver_transplant_year_2
+    
+  } 
+  
+  
+   if (M_it == "Death on waitlist") {
+    u.it <- 0
+    
+   } 
+  
+  
+   if (M_it == "Death off waitlist") {
+    u.it <- 0
+    
+   } 
+  
+  if (M_it == "Death after graft failure") {
+    u.it <- 0
+    
+  } 
+  
+  if (M_it == "Death w functioning graft") {
+    u.it <- 0
+    
+  } 
+  
+  if (M_it == "Death end stage liver") {
+    u.it <- 0
+    
+  } 
+  
+  #  # Check for specific events that incur additional costs
+  # if (event_qaly_applied_on) {
+  #   additional_qaly <- 0.21  # Example additional cost for transitioning to HCV from "On waitlist"
+  # }
+  
+  cycle_qaly <- u.it * cl
+  
+  return(cycle_qaly)
+}
+
+```
+
+# Run simulation 
+
+```{r}
+# # Start timer
+# p <- Sys.time()
+# 
+# # Parameters
+# n_sim <- 1000  # Number of PSA iterations
+# 
+# # Initialize lists to store simulation results
+# sim_shift_clinical_practice <- vector("list", n_sim)
+# sim_current_clinical_practice <- vector("list", n_sim)
+# 
+# 
+# for (sim_idx in 1:n_sim) {
+#   current_costs <- df_psa_input_costs[sim_idx, ]
+#   current_utilities <- df_psa_input_utils[sim_idx, ]
+#   current_probs <- df_psa_input_probs[sim_idx, ]
+#   
+#   # Run simulation only if there are no NA values
+#   sim_shift_clinical_practice[[sim_idx]] <- Microsim_pp(
+#     v_m_on_waitlist = v_m_on_waitlist,
+#     n_c = n_c,
+#     n_t = n_t,
+#     v_names_health_states = v_names_health_states,
+#     d.c = d.c,
+#     d.e = d.e,
+#     Trt = "Shift in practice",
+#     index = sim_idx,
+#     current_costs,
+#     current_utilities,
+#     current_probs,
+#     sim_idx,#Current iteration of the PSA
+#     n_sim # Total number of PSA iterations
+#   )
+#   
+#   sim_current_clinical_practice[[sim_idx]] <- Microsim_cp(
+#     v_m_on_waitlist = v_m_on_waitlist,
+#     n_c = n_c,
+#     n_t = n_t,
+#     v_names_health_states = v_names_health_states,
+#     d.c = d.c,
+#     d.e = d.e,
+#     Trt = "Current practice",
+#     index = sim_idx,
+#     current_costs,
+#     current_utilities,
+#     current_probs,
+#     sim_idx, #Current iteration of the PSA
+#     n_sim # Total number of PSA iterations
+#   )
+#   # Display overall progress after each simulation
+#   cat(sprintf("\nCompleted %d of %d simulations.\n", sim_idx, n_sim))
+#   
+#    # Save results of each simulation to RData files
+#   saveRDS(sim_shift_clinical_practice[[sim_idx]], file = file.path(results_shift, paste0("sim_shift_clinical_practice_", sim_idx, ".RData")))
+# 
+#   
+#   saveRDS(sim_current_clinical_practice[[sim_idx]], file = file.path(results_current, paste0("sim_current_clinical_practice_", sim_idx, ".RData")))
+#   
+#   
+# }
+
+# 
+# # Calculate elapsed time
+# comp_time <- Sys.time() - p
+# 
+# # Output results
+# print("Simulation for Shift in Practice completed.")
+# print(sim_shift_clinical_practice)
+# 
+# print("Simulation for Current Practice completed.")
+# print(sim_current_clinical_practice)
+# 
+# print("Computation time:")
+# print(comp_time)
+```
+
+
+# Cost-effectiveness analysis
+
+```{r}
+# store the mean costs (and the MCSE) of each strategy in a new variable v.C (vector costs) 
+v.C <- c(sim_shift_clinical_practice$tc_hat, sim_current_clinical_practice$tc_hat) 
+se.C <- c(sd(sim_shift_clinical_practice$tc), sd(sim_current_clinical_practice$tc)) / sqrt(n_c) 
+# store the mean QALYs (and the MCSE) of each strategy in a new variable v.E (vector health outcomes) 
+v.E <- c(sim_shift_clinical_practice$te_hat, sim_current_clinical_practice$te_hat)
+se.E <- c(sd(sim_shift_clinical_practice$te), sd(sim_current_clinical_practice$te)) / sqrt(n_c)
+
+delta.C <- v.C[1] - v.C[2] # calculate incremental costs 
+delta.E <- v.E[1] - v.E[2] # calculate incremental QALYs 
+se.delta.E <- sd(sim_shift_clinical_practice$te - sim_current_clinical_practice$te) / sqrt(n_c) # Monte Carlo squared error (MCSE) of incremental QALYs 
+se.delta.C <- sd(sim_shift_clinical_practice$tc - sim_current_clinical_practice$tc) / sqrt(n_c) # Monte Carlo squared error (MCSE) of incremental Costs 
+ICER <- delta.C / delta.E # calculate the ICER 
+results <- c(delta.C, delta.E, ICER) # store the values in a new variable
+
+table_micro <- data.frame( c(round(v.C, 0), ""), # costs per arm 
+                           c(round(se.C, 0), ""), # MCSE for costs 
+                           c(round(v.E, 3), ""), # health outcomes per arm 
+                           c(round(se.E, 3), ""), # MCSE for health outcomes 
+                           c("", round(delta.C, 0), ""), # incremental costs 
+                           c("", round(se.delta.C, 0),""), # MCSE for incremental costs 
+                           c("", round(delta.E, 3), ""), # incremental QALYs 
+                           c("", round(se.delta.E, 3),""), # MCSE for health outcomes (QALYs) gained 
+                           c("", round(ICER, 0), "") # ICER 
+) 
+rownames(table_micro) <- c(Trt, "* are MCSE values") # name the rows 
+colnames(table_micro) <- c("Costs", "*", "QALYs", "*", "Incremental Costs", "*", "QALYs Gained", "*", "ICER") # name the columns 
+# table(table_micro)
+
+```
+
