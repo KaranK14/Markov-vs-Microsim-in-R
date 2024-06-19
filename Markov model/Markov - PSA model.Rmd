@@ -3,6 +3,7 @@ title: "Probabilistic sensitivity analysis"
 author: "Karan Ketan Shah"
 date: "2024-05-03"
 output: html_document
+Adapted from Alarid-Escudero F, Krijkamp E, Enns EA, et al. An introductory tutorial on cohort state-transition models in r using a cost-effectiveness analysis example. 2023;43(1):3-20
 ---
 
 ```{r , include=FALSE}
